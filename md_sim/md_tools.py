@@ -44,57 +44,50 @@ class MDLogger:
         self.atoms_path = params["atoms_csv"]
         self.traj_path = params["trajectory_file"]
         
-        # Initialize files with headers
         self._init_csv_files()
 
     def _init_csv_files(self):
         with self.summary_path.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "time_ps", "energy_eV", "temperature_K"])
+            # UPDATED: Added new energy headers
+            writer.writerow(["step", "time_ps", "energy_pot_eV", "energy_kin_eV", "energy_tot_eV", "temperature_K"])
 
         with self.atoms_path.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "step", "atom_index",
-                "x", "y", "z",
-                "vx", "vy", "vz",
-                "fx", "fy", "fz"
+                "step", "atom_index", "x", "y", "z",
+                "vx", "vy", "vz", "fx", "fy", "fz"
             ])
 
     def __call__(self):
-        """
-        This method is called by dyn.attach() at every interval.
-        """
-        # Gather data
         step = self.dyn.nsteps
         time_ps = step * self.params["dt_fs"] / 1000.0
         
         forces = self.atoms.get_forces()
         positions = self.atoms.get_positions()
         velocities = self.atoms.get_velocities()
-        energy = self.atoms.get_potential_energy()
+        
+        # UPDATED: Calculate all three energies
+        epot = self.atoms.get_potential_energy()
+        ekin = self.atoms.get_kinetic_energy()
+        etot = epot + ekin
         temp = self.atoms.get_temperature()
 
-        # 1. Console Output
         print(f"Step: {step:6d}  Time: {time_ps:8.3f} ps  "
-              f"Energy: {energy:12.6f} eV  Temp: {temp:8.2f} K")
+              f"E_tot: {etot:12.6f} eV  Temp: {temp:8.2f} K")
 
-        # 2. Append Summary CSV
         with self.summary_path.open("a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([step, time_ps, energy, temp])
+            # UPDATED: Save all three energies
+            writer.writerow([step, time_ps, epot, ekin, etot, temp])
 
-        # 3. Append Atoms CSV (Bulk data)
         with self.atoms_path.open("a", newline="") as f:
             writer = csv.writer(f)
-            # Create a generator or list for bulk writing
             rows = []
             for i, ((x, y, z), (vx, vy, vz), (fx, fy, fz)) in enumerate(zip(positions, velocities, forces)):
                 rows.append([step, i, x, y, z, vx, vy, vz, fx, fy, fz])
             writer.writerows(rows)
 
-        # 4. Write Trajectory (ExtXYZ)
-        # Store velocities so they are written to the xyz file
         self.atoms.set_array('velocities', velocities)
-        comment = f"Time={time_ps:.3f}ps Energy={energy:.6f}eV Temp={temp:.2f}K"
+        comment = f"Time={time_ps:.3f}ps E_tot={etot:.6f}eV Temp={temp:.2f}K"
         write(self.traj_path, self.atoms, format='extxyz', append=True, comment=comment)

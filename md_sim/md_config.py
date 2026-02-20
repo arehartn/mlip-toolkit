@@ -21,5 +21,6 @@ PARAMS = {
     "atoms_csv": Path("md_atoms.csv"),
     "trajectory_file": "large_traj.xyz",
 
-    "make_plots": True
+    "make_plots": True,
+    "compare_csvs": [],
 }
