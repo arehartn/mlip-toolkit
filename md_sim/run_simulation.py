@@ -1,5 +1,6 @@
-from . import md_config
-from . import md_tools
+from md_sim import md_config
+from md_sim import md_tools
+from md_sim import md_plotting
 
 def run(config_overrides=None):
     """
@@ -43,6 +44,8 @@ def run(config_overrides=None):
     # 7. Run
     dyn.run(cfg["n_steps"])
     print("Simulation Complete.")
+
+    md_tools.generate_plots(cfg)
 
 if __name__ == "__main__":
     run()

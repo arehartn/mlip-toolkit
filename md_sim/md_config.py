@@ -19,5 +19,7 @@ PARAMS = {
     # Output Files
     "summary_csv": Path("md_summary.csv"),
     "atoms_csv": Path("md_atoms.csv"),
-    "trajectory_file": "large_traj.xyz"
+    "trajectory_file": "large_traj.xyz",
+
+    "make_plots": True
 }
