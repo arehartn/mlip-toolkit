@@ -45,7 +45,7 @@ def run(config_overrides=None):
     dyn.run(cfg["n_steps"])
     print("Simulation Complete.")
 
-    md_tools.md_plotting(cfg)
+    md_plotting.generate_plots(cfg)
 
 if __name__ == "__main__":
     run()
