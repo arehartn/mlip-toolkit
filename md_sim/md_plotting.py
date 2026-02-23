@@ -48,6 +48,9 @@ def generate_plots(params):
         print(f"Warning: {summary_file} not found. Cannot generate plots.")
         return
 
+    output_dir = Path(params.get("output_dir", "."))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     print("Generating overlay plots...")
     
     # Load current data
@@ -96,7 +99,7 @@ def generate_plots(params):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig('energy_tot_vs_step.png', dpi=300)
+    plt.savefig(output_dir / 'energy_tot_vs_step.png', dpi=300)
     plt.close()
 
     # ---------------------------------------------------------
@@ -122,7 +125,7 @@ def generate_plots(params):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig('temperature_vs_step.png', dpi=300)
+    plt.savefig(output_dir / 'temperature_vs_step.png', dpi=300)
     plt.close()
 
     # ---------------------------------------------------------
@@ -165,7 +168,7 @@ def generate_plots(params):
     axs[1].grid(True)
 
     plt.tight_layout()
-    plt.savefig('energy_kin_pot_vs_step.png', dpi=300)
+    plt.savefig(output_dir / 'energy_kin_pot_vs_step.png', dpi=300)
     plt.close()
 
     print("✅ All plots saved successfully!")
