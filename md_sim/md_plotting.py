@@ -8,7 +8,7 @@ from pathlib import Path
 # COLUMN NAME SEARCH PARTIES
 # ==========================================
 def get_tot_col(df):
-    for col in ['energy_tot_eV', 'energy_eV', 'E_tot', 'Total_Energy']:
+    for col in ['energy_tot_eV', 'energy_eV', 'E_tot', 'Total_Energy', 'E_tot_eV']:
         if col in df.columns: return col
     return None
 
@@ -18,12 +18,12 @@ def get_temp_col(df):
     return None
 
 def get_kin_col(df):
-    for col in ['energy_kin_eV', 'energy_kin', 'E_kin', 'Kinetic_Energy', 'KE']:
+    for col in ['energy_kin_eV', 'energy_kin', 'E_kin', 'Kinetic_Energy', 'KE', 'E_kin_eV']:
         if col in df.columns: return col
     return None
 
 def get_pot_col(df):
-    for col in ['energy_pot_eV', 'energy_pot', 'E_pot', 'Potential_Energy', 'PE']:
+    for col in ['energy_pot_eV', 'energy_pot', 'E_pot', 'Potential_Energy', 'PE', 'E_pot_eV']:
         if col in df.columns: return col
     return None
 
