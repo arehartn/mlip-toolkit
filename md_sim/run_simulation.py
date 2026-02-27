@@ -16,8 +16,7 @@ def run(config_overrides=None):
 
     print(f"--- Starting MD Simulation ---")
     print(f"Temp: {cfg['temp_kelvin']}K | Friction: {cfg['friction']} | dt: {cfg['dt_fs']}fs")
-    print(f"Model type: {cfg['model_type']} | Model variant: {cfg.get['model_variant']}")
-
+    print(f"Model type: {cfg['model_type']} | Model variant: {cfg['model_variant']}")
     # 3. Setup System
     atoms = md_tools.setup_atoms_and_calculator(
         structure_path=cfg["input_structure"],
