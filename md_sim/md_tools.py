@@ -4,14 +4,40 @@ from ase import units
 from ase.io import read, write
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from mace.calculators import mace_mp
 
-def setup_atoms_and_calculator(structure_path, model_type="large", device="cpu"):
+# Inside md_tools.py
+
+def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu"):
     """
-    Reads the structure and attaches the MACE calculator.
+    Reads the structure and attaches the requested MLIP calculator using lazy imports.
     """
     atoms = read(structure_path)
-    calc = mace_mp(model=model_type, device=device)
+    
+    if model_type.lower() == "mace":
+        # LAZY IMPORT
+        from mace.calculators import mace_mp 
+        print(f"Initializing MACE ({model_variant}) calculator...")
+        
+        # Simply load the built-in MACE sizes (large, medium-0b, etc.)
+        calc = mace_mp(model=model_variant, device=device)
+        
+    elif model_type.lower() == "chgnet":
+        # LAZY IMPORT
+        from chgnet.model.dynamics import CHGNetCalculator
+        from chgnet.model.model import CHGNet
+        print(f"Initializing CHGNet ({model_variant}) calculator...")
+        
+        # Load the default newest CHGNet, or a specific built-in version (like "0.2.0")
+        if model_variant in ["default", "", None]:
+            chgnet_model = CHGNet.load()
+        else:
+            chgnet_model = CHGNet.load(model_variant)
+            
+        calc = CHGNetCalculator(model=chgnet_model, use_device=device)
+        
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
     atoms.calc = calc
     return atoms
 
