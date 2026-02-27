@@ -2,15 +2,13 @@ import csv
 import numpy as np
 from ase import units
 from ase.io import read, write
+from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 
 # Inside md_tools.py
 
 def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu"):
-    """
-    Reads the structure and attaches the requested MLIP calculator using lazy imports.
-    """
     atoms = read(structure_path)
     
     if model_type.lower() == "mace":
@@ -31,7 +29,7 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
         if model_variant in ["default", "", None]:
             chgnet_model = CHGNet.load()
         else:
-            chgnet_model = CHGNet.load(model_variant)
+            chgnet_model = CHGNet.load(model_name=model_variant)
             
         calc = CHGNetCalculator(model=chgnet_model, use_device=device)
         
@@ -42,16 +40,10 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
     return atoms
 
 def initialize_velocities(atoms, temperature_K):
-    """
-    Sets initial Maxwell-Boltzmann distribution and removes drift.
-    """
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K)
     Stationary(atoms)
 
 def setup_dynamics(atoms, temperature_K, dt_fs, friction):
-    """
-    Initializes the Langevin dynamics engine.
-    """
     dyn = Langevin(atoms,
                    timestep=dt_fs * units.fs,
                    temperature_K=temperature_K,
@@ -59,23 +51,22 @@ def setup_dynamics(atoms, temperature_K, dt_fs, friction):
     return dyn
 
 class MDLogger:
-    """
-    Handles CSV initialization and per-step logging.
-    """
     def __init__(self, atoms, dynamics, params):
         self.atoms = atoms
         self.dyn = dynamics
         self.params = params
         self.summary_path = params["summary_csv"]
         self.atoms_path = params["atoms_csv"]
-        self.traj_path = params["trajectory_file"]
+        self.traj_path = str(params["trajectory_file"])
+        
+        # NEW: Initialize ASE's native binary trajectory writer
+        self.traj_writer = Trajectory(self.traj_path, 'w', self.atoms)
         
         self._init_csv_files()
 
     def _init_csv_files(self):
         with self.summary_path.open("w", newline="") as f:
             writer = csv.writer(f)
-            # UPDATED: Added new energy headers
             writer.writerow(["step", "time_ps", "energy_pot_eV", "energy_kin_eV", "energy_tot_eV", "temperature_K"])
 
         with self.atoms_path.open("w", newline="") as f:
@@ -93,7 +84,6 @@ class MDLogger:
         positions = self.atoms.get_positions()
         velocities = self.atoms.get_velocities()
         
-        # UPDATED: Calculate all three energies
         epot = self.atoms.get_potential_energy()
         ekin = self.atoms.get_kinetic_energy()
         etot = epot + ekin
@@ -104,7 +94,6 @@ class MDLogger:
 
         with self.summary_path.open("a", newline="") as f:
             writer = csv.writer(f)
-            # UPDATED: Save all three energies
             writer.writerow([step, time_ps, epot, ekin, etot, temp])
 
         with self.atoms_path.open("a", newline="") as f:
@@ -114,6 +103,8 @@ class MDLogger:
                 rows.append([step, i, x, y, z, vx, vy, vz, fx, fy, fz])
             writer.writerows(rows)
 
+        # Attach velocities so they get saved in the traj
         self.atoms.set_array('velocities', velocities)
-        comment = f"Time={time_ps:.3f}ps E_tot={etot:.6f}eV Temp={temp:.2f}K"
-        write(self.traj_path, self.atoms, format='extxyz', append=True, comment=comment)
+        
+        # NEW: Write to binary .traj cleanly (Replaces the clunky write append)
+        self.traj_writer.write()

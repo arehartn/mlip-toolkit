@@ -6,9 +6,9 @@ PARAMS = {
     "input_structure": "POSCAR",
     "temp_kelvin": 800,
     
-    # Model
-    "model_type": "large",
-    "device": "cpu",  # Change to "cuda" for GPU
+    "model_type": "mace",       # "mace" or "chgnet"
+    "model_variant": "large",   # "large", "medium-0b", "default", etc.
+    "device": "cpu",            # Change to "cuda" for GPU
     
     # Dynamics
     "dt_fs": 0.5,
@@ -19,7 +19,7 @@ PARAMS = {
     # Output Files
     "summary_csv": Path("md_summary.csv"),
     "atoms_csv": Path("md_atoms.csv"),
-    "trajectory_file": "large_traj.xyz",
+    "trajectory_file": "large_traj.traj",
 
     "make_plots": True,
     "compare_csvs": [],
