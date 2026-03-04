@@ -1,34 +1,40 @@
 import csv
 import numpy as np
 from ase import units
-from ase.io import read, write
+from ase.io import read
 from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 
-# Inside md_tools.py
-
 def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu"):
+    """
+    Reads the structure and attaches the requested MLIP calculator using lazy imports.
+    """
     atoms = read(structure_path)
+    model_variant = str(model_variant).strip()
     
     if model_type.lower() == "mace":
-        # LAZY IMPORT
-        from mace.calculators import mace_mp 
-        print(f"Initializing MACE ({model_variant}) calculator...")
-        
-        # Simply load the built-in MACE sizes (large, medium-0b, etc.)
-        calc = mace_mp(model=model_variant, device=device)
+        # --- FIX 1: Support for your fine-tuned model ---
+        if model_variant.endswith(".model"):
+            from mace.calculators import MACECalculator
+            print(f"Loading custom fine-tuned MACE model: {model_variant}...")
+            # Use the base MACECalculator for local fine-tuned weights
+            calc = MACECalculator(model_paths=model_variant, device=device)
+        else:
+            from mace.calculators import mace_mp 
+            print(f"Initializing MACE Foundation ({model_variant}) calculator...")
+            calc = mace_mp(model=model_variant, device=device)
         
     elif model_type.lower() == "chgnet":
-        # LAZY IMPORT
         from chgnet.model.dynamics import CHGNetCalculator
         from chgnet.model.model import CHGNet
         print(f"Initializing CHGNet ({model_variant}) calculator...")
         
-        # Load the default newest CHGNet, or a specific built-in version (like "0.2.0")
-        if model_variant in ["default", "", None]:
+        if model_variant.lower() in ["default", "", "none"]:
+            print("Loading standard default CHGNet weights...")
             chgnet_model = CHGNet.load()
         else:
+            print(f"Attempting to load specific CHGNet weights: {model_variant}")
             chgnet_model = CHGNet.load(model_name=model_variant)
             
         calc = CHGNetCalculator(model=chgnet_model, use_device=device)
@@ -39,14 +45,24 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
     atoms.calc = calc
     return atoms
 
-def initialize_velocities(atoms, temperature_K):
-    MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K)
-    Stationary(atoms)
+def initialize_velocities(atoms, temperature_K, seed=42):
+    # --- FIX 2: Apply the deterministic seed to the velocities ---
+    rng = np.random.RandomState(seed)
+    
+    # ASE requires temperature in eV (temperature_K * units.kB) when setting velocities!
+    MaxwellBoltzmannDistribution(
+        atoms, 
+        temperature_K=temperature_K * units.kB, 
+        force_temp=True, 
+        rng=rng
+    )
+    Stationary(atoms) # Removes center of mass translation
 
 def setup_dynamics(atoms, temperature_K, dt_fs, friction):
+    # Langevin stochastic noise is handled by the global np.random seed we set in run_simulation.py
     dyn = Langevin(atoms,
                    timestep=dt_fs * units.fs,
-                   temperature_K=temperature_K,
+                   temperature_K=temperature_K * units.kB, # ASE Langevin also needs temp in eV
                    friction=friction)
     return dyn
 
@@ -59,9 +75,7 @@ class MDLogger:
         self.atoms_path = params["atoms_csv"]
         self.traj_path = str(params["trajectory_file"])
         
-        # NEW: Initialize ASE's native binary trajectory writer
         self.traj_writer = Trajectory(self.traj_path, 'w', self.atoms)
-        
         self._init_csv_files()
 
     def _init_csv_files(self):
@@ -89,8 +103,7 @@ class MDLogger:
         etot = epot + ekin
         temp = self.atoms.get_temperature()
 
-        print(f"Step: {step:6d}  Time: {time_ps:8.3f} ps  "
-              f"E_tot: {etot:12.6f} eV  Temp: {temp:8.2f} K")
+        print(f"Step: {step:6d}  Time: {time_ps:8.3f} ps  E_tot: {etot:12.6f} eV  Temp: {temp:8.2f} K")
 
         with self.summary_path.open("a", newline="") as f:
             writer = csv.writer(f)
@@ -103,8 +116,5 @@ class MDLogger:
                 rows.append([step, i, x, y, z, vx, vy, vz, fx, fy, fz])
             writer.writerows(rows)
 
-        # Attach velocities so they get saved in the traj
         self.atoms.set_array('velocities', velocities)
-        
-        # NEW: Write to binary .traj cleanly (Replaces the clunky write append)
         self.traj_writer.write()
