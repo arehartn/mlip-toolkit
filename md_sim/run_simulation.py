@@ -38,12 +38,7 @@ def run(config_overrides=None):
 
     # 5. Setup Dynamics Engine (The Thermostat)
     # We pass the parameters directly from your config dictionary 'cfg'
-    dyn = md_tools.setup_dynamics(
-        atoms, 
-        temperature_K=cfg["temp_kelvin"], 
-        dt_fs=cfg["dt_fs"], 
-        friction=cfg["friction"]
-    )
+    dyn = md_tools.setup_dynamics(atoms, cfg)
 
     # 6. Attach Logger
     # The logger uses 'cfg' to decide where to save files

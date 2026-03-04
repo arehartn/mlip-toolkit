@@ -5,6 +5,10 @@ from ase.io import read
 from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
+from ase.md.velocityverlet import VelocityVerlet
+from ase.md.npt import NPT
+from ase import units
+
 
 def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu"):
     """
@@ -58,12 +62,40 @@ def initialize_velocities(atoms, temperature_K, seed=42):
     )
     Stationary(atoms) # Removes center of mass translation
 
-def setup_dynamics(atoms, temperature_K, dt_fs, friction):
-    # Langevin stochastic noise is handled by the global np.random seed we set in run_simulation.py
-    dyn = Langevin(atoms,
-                   timestep=dt_fs * units.fs,
-                   temperature_K=temperature_K * units.kB, # ASE Langevin also needs temp in eV
-                   friction=friction)
+def setup_dynamics(atoms, cfg):
+    """Sets up the ASE dynamics engine based on the chosen ensemble."""
+    ensemble = cfg.get("ensemble", "NVT").upper()
+    dt = cfg["dt_fs"] * units.fs
+    temp = cfg["temp_kelvin"] * units.kB
+    
+    if ensemble == "NVE":
+        print("Setting up NVE ensemble (Velocity Verlet)...")
+        dyn = VelocityVerlet(atoms, timestep=dt)
+        
+    elif ensemble == "NVT":
+        print(f"Setting up NVT ensemble (Langevin) at {cfg['temp_kelvin']}K...")
+        dyn = Langevin(
+            atoms,
+            timestep=dt,
+            temperature_K=temp,
+            friction=cfg.get("friction", 0.01)
+        )
+        
+    elif ensemble == "NPT":
+        print(f"Setting up NPT ensemble at {cfg['temp_kelvin']}K and {cfg.get('pressure_bar', 1.0)} bar...")
+        pressure = cfg.get("pressure_bar", 1.0) * units.bar
+        dyn = NPT(
+            atoms,
+            timestep=dt,
+            temperature_K=temp,
+            externalstress=pressure,
+            ttime=cfg.get("ttime_fs", 25.0) * units.fs,
+            ptime=cfg.get("ptime_fs", 75.0) * units.fs
+        )
+        
+    else:
+        raise ValueError(f"Unknown ensemble requested: {ensemble}")
+        
     return dyn
 
 class MDLogger:
