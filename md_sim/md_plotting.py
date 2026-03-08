@@ -58,14 +58,26 @@ def generate_plots(params):
     
     # Load comparison data
     compare_dfs = []
-    for f in params.get("compare_csvs", []):
-        path = Path(f)
-        if path.exists():
-            compare_dfs.append((path.name, pd.read_csv(path)))
-        else:
-            print(f"Warning: Compare file {f} not found.")
+    compare_input = params.get("compare_csvs", {})
 
-    # --- Extract Custom Column Lists from Params ---
+    # If the user provides a Dictionary (Custom Label -> File Path)
+    if isinstance(compare_input, dict):
+        for custom_label, f in compare_input.items():
+            path = Path(f)
+            if path.exists():
+                compare_dfs.append((custom_label, pd.read_csv(path)))
+            else:
+                print(f"Warning: Compare file {f} not found.")
+
+    # Fallback: If the user still provides a List (uses filename as label)
+    elif isinstance(compare_input, list):
+        for f in compare_input:
+            path = Path(f)
+            if path.exists():
+                compare_dfs.append((path.name, pd.read_csv(path)))
+            else:
+                print(f"Warning: Compare file {f} not found.")
+
     cust_x = params.get("custom_x_cols", [])
     cust_tot = params.get("custom_tot_cols", [])
     cust_temp = params.get("custom_temp_cols", [])
