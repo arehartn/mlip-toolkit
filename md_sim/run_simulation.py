@@ -1,26 +1,18 @@
 from md_sim import md_config
 from md_sim import md_tools
 from md_sim import md_plotting
-import torch
-import numpy as np
-import random
 
 def run(config_overrides=None):
+    """
+    Main execution function.
+    config_overrides: A dictionary containing ANY parameter you want to change.
+    """
     # 1. Start with defaults from md_config.py
     cfg = md_config.PARAMS.copy()
     
     # 2. Update with your custom settings from the runner script
     if config_overrides:
         cfg.update(config_overrides)
-
-    seed = cfg.get("random_seed", 42) # Grabs the seed from your control panel
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
     print(f"--- Starting MD Simulation ---")
     print(f"Temp: {cfg['temp_kelvin']}K | Friction: {cfg['friction']} | dt: {cfg['dt_fs']}fs")
