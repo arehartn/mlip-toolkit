@@ -5,8 +5,6 @@ from ase.io import read, write
 from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from ase.md.velocityverlet import VelocityVerlet
-from ase.md.npt import NPT
 from ase import units
 
 
@@ -16,12 +14,20 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
     atoms = read(structure_path)
     
     if model_type.lower() == "mace":
-        # LAZY IMPORT
-        from mace.calculators import mace_mp 
         print(f"Initializing MACE ({model_variant}) calculator...")
         
-        # Simply load the built-in MACE sizes (large, medium-0b, etc.)
-        calc = mace_mp(model=model_variant, device=device)
+        # --- THE UPGRADE: Check if using a custom fine-tuned model ---
+        if str(model_variant).endswith(".model"):
+            from mace.calculators import MACECalculator
+            calc = MACECalculator(
+                model_paths=str(model_variant), 
+                device=device, 
+                default_dtype='float64'
+            )
+        else:
+            # Fallback: Load the built-in MACE sizes (large, medium-0b, etc.)
+            from mace.calculators import mace_mp
+            calc = mace_mp(model=model_variant, device=device)
         
     elif model_type.lower() == "chgnet":
         # LAZY IMPORT
@@ -47,48 +53,11 @@ def initialize_velocities(atoms, temperature_K):
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K)
     Stationary(atoms)
 
-<<<<<<< HEAD
-def setup_dynamics(atoms, cfg):
-    """Sets up the ASE dynamics engine based on the chosen ensemble."""
-    ensemble = cfg.get("ensemble", "NVT").upper()
-    dt = cfg["dt_fs"] * units.fs
-    temp = cfg["temp_kelvin"] * units.kB
-    
-    if ensemble == "NVE":
-        print("Setting up NVE ensemble (Velocity Verlet)...")
-        dyn = VelocityVerlet(atoms, timestep=dt)
-        
-    elif ensemble == "NVT":
-        print(f"Setting up NVT ensemble (Langevin) at {cfg['temp_kelvin']}K...")
-        dyn = Langevin(
-            atoms,
-            timestep=dt,
-            temperature_K=temp,
-            friction=cfg.get("friction", 0.01)
-        )
-        
-    elif ensemble == "NPT":
-        print(f"Setting up NPT ensemble at {cfg['temp_kelvin']}K and {cfg.get('pressure_bar', 1.0)} bar...")
-        pressure = cfg.get("pressure_bar", 1.0) * units.bar
-        dyn = NPT(
-            atoms,
-            timestep=dt,
-            temperature_K=temp,
-            externalstress=pressure,
-            ttime=cfg.get("ttime_fs", 25.0) * units.fs,
-            ptime=cfg.get("ptime_fs", 75.0) * units.fs
-        )
-        
-    else:
-        raise ValueError(f"Unknown ensemble requested: {ensemble}")
-        
-=======
 def setup_dynamics(atoms, temperature_K, dt_fs, friction):
     dyn = Langevin(atoms,
                    timestep=dt_fs * units.fs,
                    temperature_K=temperature_K,
                    friction=friction)
->>>>>>> parent of 2c95ff6 (Added abilty to set seed)
     return dyn
 
 class MDLogger:
