@@ -39,7 +39,7 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
         if model_variant in ["default", "", None]:
             chgnet_model = CHGNet.load()
         else:
-            chgnet_model = CHGNet.load(model_name=model_variant)
+            chgnet_model = CHGNet.load(model_name=model_variant, compute_stress=False)
             
         calc = CHGNetCalculator(model=chgnet_model, use_device=device)
         
