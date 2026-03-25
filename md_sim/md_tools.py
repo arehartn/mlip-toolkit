@@ -39,9 +39,9 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
         if model_variant in ["default", "", None]:
             chgnet_model = CHGNet.load()
         else:
-            chgnet_model = CHGNet.load(model_name=model_variant, compute_stress=False)
+            chgnet_model = CHGNet.load(model_name=model_variant)
             
-        calc = CHGNetCalculator(model=chgnet_model, use_device=device)
+        calc = CHGNetCalculator(model=chgnet_model, use_device=device, compute_stress=False)
         
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
