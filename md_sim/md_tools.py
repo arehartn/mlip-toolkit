@@ -27,7 +27,7 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
         else:
             # Fallback: Load the built-in MACE sizes (large, medium-0b, etc.)
             from mace.calculators import mace_mp
-            calc = mace_mp(model=model_variant, device=device)
+            calc = mace_mp(model=model_variant, device=device, default_dtype='float64')
         
     elif model_type.lower() == "chgnet":
         # LAZY IMPORT
