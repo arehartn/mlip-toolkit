@@ -1,6 +1,6 @@
 import os
 from ase.io import write
-from ase.constraints import ExpCellFilter
+from ase.filters import FrechetCellFilter
 from ase.optimize.precon import PreconLBFGS
 from md_sim import md_tools
 
@@ -37,7 +37,7 @@ def run(config_overrides=None):
     )
 
     # Filter to allow unit cell volume/shape to relax
-    ucf = ExpCellFilter(atoms)
+    ucf = FrechetCellFilter(atoms)
     
     # Setup PreconLBFGS
     opt = PreconLBFGS(
