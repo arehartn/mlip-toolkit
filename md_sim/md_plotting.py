@@ -99,71 +99,68 @@ def _plot_velocity_histogram(csv_path, output_png):
 
 
 def _get_energy(frame):
-    """
-    Robustly extract energy from a frame regardless of source format.
-    - For frames with a calculator (e.g. .traj from MACE): use get_potential_energy()
-    - For extxyz/DFT reference frames: energy lives in atoms.info dict
-    """
-    # Try calculator first (predicted/ML frames)
+    """Robustly extract energy from a frame, checking calculators, results, and info."""
+    # 1. Check if it's a SinglePointCalculator or similar with stored results
     if frame.calc is not None:
+        if hasattr(frame.calc, 'results'):
+            if 'energy' in frame.calc.results:
+                return float(frame.calc.results['energy'])
+            if 'free_energy' in frame.calc.results:
+                return float(frame.calc.results['free_energy'])
+        
+        # Try the standard method but catch the PropertyNotImplementedError
         try:
             return frame.get_potential_energy()
         except Exception:
             pass
 
-    # Fallback: extxyz stores energy in info dict under various key names
-    for key in ['energy', 'REF_energy', 'dft_energy', 'Energy', 'E']:
+    # 2. Fallback: Check the info dictionary (common for .extxyz files)
+    for key in ['energy', 'REF_energy', 'dft_energy', 'Energy', 'E', 'free_energy']:
         if key in frame.info:
             return float(frame.info[key])
 
-    raise ValueError(
-        f"Could not extract energy from frame. "
-        f"Calculator: {frame.calc}, info keys: {list(frame.info.keys())}"
-    )
+    raise ValueError(f"Could not find energy. Available info: {list(frame.info.keys())}")
 
 
 def _get_forces(frame):
-    """
-    Robustly extract forces from a frame regardless of source format.
-    - For frames with a calculator: use get_forces()
-    - For extxyz/DFT reference frames: forces live in arrays dict
-    """
+    """Robustly extract forces from a frame."""
+    # 1. Check calculator results
     if frame.calc is not None:
+        if hasattr(frame.calc, 'results') and 'forces' in frame.calc.results:
+            return np.array(frame.calc.results['forces'])
         try:
             return frame.get_forces()
         except Exception:
             pass
 
+    # 2. Fallback: Check arrays (where .extxyz usually stores force arrays)
     for key in ['forces', 'REF_forces', 'dft_forces', 'Forces', 'force']:
         if key in frame.arrays:
             return np.array(frame.arrays[key])
 
-    raise ValueError(
-        f"Could not extract forces from frame. "
-        f"Calculator: {frame.calc}, arrays keys: {list(frame.arrays.keys())}"
-    )
+    raise ValueError(f"Could not find forces. Available arrays: {list(frame.arrays.keys())}")
 
 
 def plot_parity(true_traj_path, pred_traj_path, output_prefix):
-    """Compares reference energies/forces vs ML predictions."""
-    print(f"Loading reference: {true_traj_path}")
-    print(f"Loading predicted: {pred_traj_path}")
+    """Generates energy and force parity plots comparing reference to prediction."""
+    print(f"Reading trajectories for parity:\n  Ref:  {true_traj_path}\n  Pred: {pred_traj_path}")
+    
+    try:
+        true_frames = read(str(true_traj_path), index=":")
+        pred_frames = read(str(pred_traj_path), index=":")
+    except Exception as e:
+        print(f"ERROR reading trajectory files: {e}")
+        return
 
-    true_frames = read(true_traj_path, index=':')
-    pred_frames = read(pred_traj_path, index=':')
-
-    print(f"Reference frames: {len(true_frames)}, Predicted frames: {len(pred_frames)}")
-
-    # Match frame counts — use the minimum to avoid index errors
-    n_frames = min(len(true_frames), len(pred_frames))
+    # Match frame counts
     if len(true_frames) != len(pred_frames):
-        print(f"WARNING: Frame count mismatch. Using first {n_frames} frames for parity.")
-    true_frames = true_frames[:n_frames]
-    pred_frames = pred_frames[:n_frames]
+        n = min(len(true_frames), len(pred_frames))
+        print(f"Warning: Frame mismatch ({len(true_frames)} vs {len(pred_frames)}). Using first {n} frames.")
+        true_frames, pred_frames = true_frames[:n], pred_frames[:n]
 
     n_atoms = len(true_frames[0])
 
-    # --- Extract energies ---
+    # --- 1. Energy Parity ---
     true_e, pred_e = [], []
     for i, (tf, pf) in enumerate(zip(true_frames, pred_frames)):
         try:
@@ -172,25 +169,26 @@ def plot_parity(true_traj_path, pred_traj_path, output_prefix):
         except ValueError as e:
             print(f"Skipping frame {i} for energy: {e}")
 
-    if len(true_e) == 0:
-        print("ERROR: No energy data could be extracted. Skipping energy parity plot.")
-    else:
-        print(f"Plotting energy parity ({len(true_e)} frames)...")
+    if len(true_e) > 0:
+        mae = mean_absolute_error(true_e, pred_e) * 1000 # to meV
+        
         plt.figure(figsize=(6, 6))
-        plt.scatter(true_e, pred_e, alpha=0.6, color='royalblue')
+        plt.scatter(true_e, pred_e, alpha=0.6, color='royalblue', edgecolors='k', s=20)
+        
+        # Add diagonal line
         lims = [min(min(true_e), min(pred_e)), max(max(true_e), max(pred_e))]
-        plt.plot(lims, lims, 'r--', label="Perfect Agreement")
-        mae = mean_absolute_error(true_e, pred_e) * 1000
-        plt.title(f"Energy Parity (MAE: {mae:.2f} meV/atom)")
+        plt.plot(lims, lims, 'r--', alpha=0.7, label=f'MAE: {mae:.2f} meV/atom')
+        
         plt.xlabel("Reference Energy (eV/atom)")
         plt.ylabel("Predicted Energy (eV/atom)")
+        plt.title("Energy Parity")
         plt.legend()
         plt.tight_layout()
         plt.savefig(f"{output_prefix}_energy.png", dpi=300)
         plt.close()
-        print(f"Saved: {output_prefix}_energy.png  |  MAE = {mae:.2f} meV/atom")
+        print(f"Saved: {output_prefix}_energy.png")
 
-    # --- Extract forces ---
+    # --- 2. Force Parity ---
     true_f_all, pred_f_all = [], []
     for i, (tf, pf) in enumerate(zip(true_frames, pred_frames)):
         try:
@@ -199,22 +197,22 @@ def plot_parity(true_traj_path, pred_traj_path, output_prefix):
         except ValueError as e:
             print(f"Skipping frame {i} for forces: {e}")
 
-    if len(true_f_all) == 0:
-        print("ERROR: No force data could be extracted. Skipping force parity plot.")
-    else:
+    if len(true_f_all) > 0:
         true_f = np.concatenate(true_f_all)
         pred_f = np.concatenate(pred_f_all)
-        print(f"Plotting force parity ({len(true_f_all)} frames, {len(true_f)} components)...")
+        mae_f = mean_absolute_error(true_f, pred_f)
 
         plt.figure(figsize=(6, 6))
         plt.scatter(true_f, pred_f, alpha=0.1, s=1, color='darkorange')
+        
         lims = [min(min(true_f), min(pred_f)), max(max(true_f), max(pred_f))]
-        plt.plot(lims, lims, 'r--')
-        mae_f = mean_absolute_error(true_f, pred_f)
-        plt.title(f"Force Parity (MAE: {mae_f:.3f} eV/Å)")
+        plt.plot(lims, lims, 'k--', alpha=0.5, label=f'MAE: {mae_f:.3f} eV/Å')
+        
         plt.xlabel("Reference Force (eV/Å)")
         plt.ylabel("Predicted Force (eV/Å)")
+        plt.title("Force Component Parity")
+        plt.legend()
         plt.tight_layout()
-        plt.savefig(f"{output_prefix}_force.png", dpi=300)
+        plt.savefig(f"{output_prefix}_forces.png", dpi=300)
         plt.close()
-        print(f"Saved: {output_prefix}_force.png  |  MAE = {mae_f:.3f} eV/Å")
+        print(f"Saved: {output_prefix}_forces.png")
