@@ -1,24 +1,26 @@
 import pandas as pd
+import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') # Necessary for head-less servers/supercomputers
 import matplotlib.pyplot as plt
 from pathlib import Path
+from ase.io import read
+
+# Try to import sklearn for the MAE calculation, fall back to manual if not found
+try:
+    from sklearn.metrics import mean_absolute_error
+except ImportError:
+    def mean_absolute_error(y_true, y_pred):
+        return np.mean(np.abs(np.array(y_true) - np.array(y_pred)))
 
 # ==========================================
-# UPGRADED COLUMN NAME SEARCH PARTIES
+# 1. COLUMN SEARCH HELPERS (Your Original Logic)
 # ==========================================
 def check_columns(df, custom_list, default_list):
-    """Combines custom names with the default list and searches the dataframe."""
-    # Ensure custom_list is a list (even if the user passes a single string)
-    if isinstance(custom_list, str): 
-        custom_list = [custom_list]
-    elif custom_list is None: 
-        custom_list = []
-    
-    # Search custom names first, then fall back to defaults
+    if isinstance(custom_list, str): custom_list = [custom_list]
+    elif custom_list is None: custom_list = []
     for col in custom_list + default_list:
-        if col in df.columns: 
-            return col
+        if col in df.columns: return col
     return None
 
 def get_x_col(df, custom_names=None):
@@ -31,156 +33,141 @@ def get_temp_col(df, custom_names=None):
     return check_columns(df, custom_names, ['temperature_K', 'temp_sim_K', 'temp_inst_K', 'Temperature', 'T'])
 
 def get_kin_col(df, custom_names=None):
-    return check_columns(df, custom_names, ['energy_kin_eV', 'energy_kin', 'E_kin', 'Kinetic_Energy', 'KE', 'E_kin_eV'])
+    return check_columns(df, custom_names, ['energy_kin_eV', 'energy_kin', 'E_kin'])
 
 def get_pot_col(df, custom_names=None):
-    return check_columns(df, custom_names, ['energy_pot_eV', 'energy_pot', 'E_pot', 'Potential_Energy', 'PE', 'E_pot_eV'])
+    return check_columns(df, custom_names, ['energy_pot_eV', 'energy_pot', 'E_pot'])
 
 # ==========================================
-# MAIN PLOTTING FUNCTION
+# 2. TIME-SERIES PLOTS (Energy/Temp vs Step)
 # ==========================================
-def generate_plots(params):
-    if not params.get("make_plots", False):
-        return
-
-    summary_file = Path(params["summary_csv"])
-    if not summary_file.exists():
-        print(f"Warning: {summary_file} not found. Cannot generate plots.")
-        return
-
-    output_dir = Path(params.get("output_dir", "."))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Generating overlay plots...")
+def generate_plots(current_csv, compare_csvs=None, output_name="md_results.png"):
+    """Generates the standard MD overview (Kinetic/Potential Energy & Temp)."""
+    if compare_csvs is None: compare_csvs = {}
     
-    # Load current data
-    current_df = pd.read_csv(summary_file)
+    current_df = pd.read_csv(current_csv)
+    compare_dfs = [(name, pd.read_csv(path)) for name, path in compare_csvs.items()]
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
     
-    # Load comparison data
-    compare_dfs = []
-    compare_input = params.get("compare_csvs", {})
-
-    # If the user provides a Dictionary (Custom Label -> File Path)
-    if isinstance(compare_input, dict):
-        for custom_label, f in compare_input.items():
-            path = Path(f)
-            if path.exists():
-                compare_dfs.append((custom_label, pd.read_csv(path)))
-            else:
-                print(f"Warning: Compare file {f} not found.")
-
-    # Fallback: If the user still provides a List (uses filename as label)
-    elif isinstance(compare_input, list):
-        for f in compare_input:
-            path = Path(f)
-            if path.exists():
-                compare_dfs.append((path.name, pd.read_csv(path)))
-            else:
-                print(f"Warning: Compare file {f} not found.")
-
-    cust_x = params.get("custom_x_cols", [])
-    cust_tot = params.get("custom_tot_cols", [])
-    cust_temp = params.get("custom_temp_cols", [])
-    cust_kin = params.get("custom_kin_cols", [])
-    cust_pot = params.get("custom_pot_cols", [])
-
-    # --- Extract Custom Titles and Labels ---
-    x_label_text = params.get("x_label", "Step")
-    current_label = params.get("current_run_label", "Current Run")
-
-    # ---------------------------------------------------------
-    # PLOT 1: TOTAL ENERGY VS STEP
-    # ---------------------------------------------------------
-    plt.figure(figsize=(10, 6))
+    curr_x = get_x_col(current_df)
     
-    curr_x = get_x_col(current_df, cust_x)
-    curr_col = get_tot_col(current_df, cust_tot)
+    # --- Top Subplot: Kinetic & Potential Energy ---
+    # Plot Kinetic
+    c_kin = get_kin_col(current_df)
+    if c_kin: axs[0].plot(current_df[curr_x], current_df[c_kin], label="Current Kin", color='black', alpha=0.3)
     
-    if curr_col and curr_x in current_df.columns:
-        plt.plot(current_df[curr_x], current_df[curr_col], label=current_label, linewidth=2, color='black')
-    
+    # Plot Potential
+    c_pot = get_pot_col(current_df)
+    if c_pot: axs[0].plot(current_df[curr_x], current_df[c_pot], label="Current Pot", color='black', linewidth=2)
+
     for name, df in compare_dfs:
-        comp_x = get_x_col(df, cust_x)
-        comp_col = get_tot_col(df, cust_tot)
-        if comp_col and comp_x in df.columns:
-            plt.plot(df[comp_x], df[comp_col], label=name, alpha=0.7)
+        cx, cp = get_x_col(df), get_pot_col(df)
+        if cp: axs[0].plot(df[cx], df[cp], label=f"{name} Pot", linestyle='--')
 
-    plt.xlabel(x_label_text)
-    plt.ylabel(params.get("tot_y_label", 'Total Energy (eV)'))
-    plt.title(params.get("tot_title", 'Total Energy vs Step'))
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(output_dir / 'energy_tot_vs_step.png', dpi=300)
-    plt.close()
-
-    # ---------------------------------------------------------
-    # PLOT 2: TEMPERATURE VS STEP
-    # ---------------------------------------------------------
-    plt.figure(figsize=(10, 6))
-    
-    curr_x = get_x_col(current_df, cust_x)
-    curr_col = get_temp_col(current_df, cust_temp)
-    
-    if curr_col and curr_x in current_df.columns:
-        plt.plot(current_df[curr_x], current_df[curr_col], label=current_label, linewidth=2, color='black')
-    
-    for name, df in compare_dfs:
-        comp_x = get_x_col(df, cust_x)
-        comp_col = get_temp_col(df, cust_temp)
-        if comp_col and comp_x in df.columns:
-            plt.plot(df[comp_x], df[comp_col], label=name, alpha=0.7)
-
-    plt.xlabel(x_label_text)
-    plt.ylabel(params.get("temp_y_label", 'Temperature (K)'))
-    plt.title(params.get("temp_title", 'Temperature vs Step'))
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(output_dir / 'temperature_vs_step.png', dpi=300)
-    plt.close()
-
-    # ---------------------------------------------------------
-    # PLOT 3: KINETIC & POTENTIAL ENERGY (Subplots)
-    # ---------------------------------------------------------
-    fig, axs = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
-
-    curr_x = get_x_col(current_df, cust_x)
-
-    # --- Top Subplot: Kinetic Energy ---
-    curr_kin = get_kin_col(current_df, cust_kin)
-    if curr_kin and curr_x in current_df.columns:
-        axs[0].plot(current_df[curr_x], current_df[curr_kin], label=current_label, linewidth=2, color='black')
-    
-    for name, df in compare_dfs:
-        comp_x = get_x_col(df, cust_x)
-        comp_kin = get_kin_col(df, cust_kin)
-        if comp_kin and comp_x in df.columns:
-            axs[0].plot(df[comp_x], df[comp_kin], label=name, alpha=0.7)
-
-    axs[0].set_ylabel(params.get("kin_y_label", 'Kinetic Energy (eV)'))
-    axs[0].set_title(params.get("kin_pot_title", 'Kinetic & Potential Energy vs Step'))
+    axs[0].set_ylabel("Energy (eV)")
+    axs[0].set_title("Energy vs Step")
     axs[0].legend()
-    axs[0].grid(True)
+    axs[0].grid(True, alpha=0.3)
 
-    # --- Bottom Subplot: Potential Energy ---
-    curr_pot = get_pot_col(current_df, cust_pot)
-    if curr_pot and curr_x in current_df.columns:
-        axs[1].plot(current_df[curr_x], current_df[curr_pot], label=current_label, linewidth=2, color='black')
+    # --- Bottom Subplot: Temperature ---
+    c_temp = get_temp_col(current_df)
+    if c_temp: axs[1].plot(current_df[curr_x], current_df[c_temp], color='red', label="Temperature")
     
-    for name, df in compare_dfs:
-        comp_x = get_x_col(df, cust_x)
-        comp_pot = get_pot_col(df, cust_pot)
-        if comp_pot and comp_x in df.columns:
-            axs[1].plot(df[comp_x], df[comp_pot], label=name, alpha=0.7)
-
-    axs[1].set_xlabel(x_label_text)
-    axs[1].set_ylabel(params.get("pot_y_label", 'Potential Energy (eV)'))
-    axs[1].legend()
-    axs[1].grid(True)
+    axs[1].set_ylabel("Temperature (K)")
+    axs[1].set_xlabel("Step")
+    axs[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(output_dir / 'energy_kin_pot_vs_step.png', dpi=300)
+    plt.savefig(output_name, dpi=300)
     plt.close()
+    print(f"Saved MD Overview Plot to {output_name}")
 
-    print("✅ All plots saved successfully!")
+# ==========================================
+# 3. VELOCITY HISTOGRAMS (3 Subplots)
+# ==========================================
+def plot_velocity_histogram(atoms_csv_path="md_atoms.csv", output_png="velocity_histogram.png"):
+    try:
+        df = pd.read_csv(atoms_csv_path)
+    except FileNotFoundError:
+        print(f"Skipping velocity plot: {atoms_csv_path} not found.")
+        return
+
+    last_step = df['step'].max()
+    df_last = df[df['step'] == last_step]
+    
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f'Velocity Distributions at Step {last_step}', fontsize=14)
+    
+    colors = ['red', 'green', 'blue']
+    labels = ['vx', 'vy', 'vz']
+    
+    for i, col in enumerate(labels):
+        axs[i].hist(df_last[col], bins=30, alpha=0.7, color=colors[i], edgecolor='black')
+        axs[i].set_title(f'{col.upper()} Distribution')
+        axs[i].set_xlabel('Velocity')
+        axs[i].set_ylabel('Atom Count')
+        axs[i].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=300)
+    plt.close()
+    print(f"Saved Velocity Histograms to {output_png}")
+
+# ==========================================
+# 4. ACCURACY PLOTS (Parity Plots)
+# ==========================================
+def plot_parity(true_traj_path, pred_traj_path, output_prefix="accuracy_parity"):
+    print("Loading trajectories for Accuracy (Parity) Plots...")
+    try:
+        true_frames = read(true_traj_path, index=':')
+        pred_frames = read(pred_traj_path, index=':')
+    except Exception as e:
+        print(f"Error loading trajectories for parity: {e}")
+        return
+
+    # --- Energy Parity ---
+    n = len(true_frames[0])
+    true_e = [f.get_potential_energy()/n for f in true_frames]
+    pred_e = [f.get_potential_energy()/n for f in pred_frames]
+    
+    plt.figure(figsize=(6, 6))
+    plt.scatter(true_e, pred_e, alpha=0.6, color='royalblue')
+    lims = [min(true_e), max(true_e)]
+    plt.plot(lims, lims, 'r--', label="Perfect Agreement")
+    plt.title(f"Energy Parity (MAE: {mean_absolute_error(true_e, pred_e)*1000:.2f} meV/atom)")
+    plt.xlabel("True r2SCAN Energy (eV/atom)")
+    plt.ylabel("Predicted PBE Energy (eV/atom)")
+    plt.legend(); plt.grid(True, alpha=0.3)
+    plt.savefig(f"{output_prefix}_energy.png", dpi=300); plt.close()
+
+    # --- Force Parity ---
+    true_f = np.concatenate([f.get_forces().flatten() for f in true_frames])
+    pred_f = np.concatenate([f.get_forces().flatten() for f in pred_frames])
+    
+    plt.figure(figsize=(6, 6))
+    plt.scatter(true_f, pred_f, alpha=0.1, s=1, color='darkorange')
+    lims = [min(true_f), max(true_f)]
+    plt.plot(lims, lims, 'r--')
+    plt.title(f"Force Parity (MAE: {mean_absolute_error(true_f, pred_f):.3f} eV/Å)")
+    plt.xlabel("True r2SCAN Force (eV/Å)")
+    plt.ylabel("Predicted PBE Force (eV/Å)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{output_prefix}_force.png", dpi=300); plt.close()
+    print(f"Saved Accuracy Plots to {output_prefix}_energy/force.png")
+
+# ==========================================
+# 5. IMPLEMENTATION / RUNNER
+# ==========================================
+if __name__ == "__main__":
+    # A. Standard MD results
+    generate_plots(current_csv="md_summary.csv", 
+                   compare_csvs={"PBE_Model": "pbe_predictions.csv"})
+    
+    # B. Velocity Bell Curves
+    plot_velocity_histogram(atoms_csv_path="md_atoms.csv")
+    
+    # C. Accuracy / Parity (The important ones!)
+    # Assumes 'large_traj.traj' is r2SCAN and 'pbe_evaluated.traj' is your PBE evaluation
+    plot_parity(true_traj_path="large_traj.traj", 
+                pred_traj_path="pbe_evaluated.traj")
