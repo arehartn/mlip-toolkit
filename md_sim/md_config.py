@@ -23,4 +23,5 @@ PARAMS = {
 
     "make_plots": True,
     "compare_csvs": [],
+    "reference_traj_file": None,
 }
