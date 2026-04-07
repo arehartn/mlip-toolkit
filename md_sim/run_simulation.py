@@ -76,5 +76,8 @@ def run(config_overrides=None):
     if cfg.get("make_plots", False):
         md_plotting.generate_plots(cfg)
 
+    if cfg.get("run_validation", False):
+        print("\n--- Transitioning to Validation Phase ---")
+        validation.run(cfg)
 if __name__ == "__main__":
     run()

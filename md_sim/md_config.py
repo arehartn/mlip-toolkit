@@ -21,7 +21,9 @@ PARAMS = {
     "atoms_csv": Path("md_atoms.csv"),
     "trajectory_file": "large_traj.traj",
 
-    "make_plots": True,
+    "make_plots": False,
     "compare_csvs": [],
+    "run_validation": False,
     "reference_traj_file": None,
+    "equilibration_frame": 0,
 }
