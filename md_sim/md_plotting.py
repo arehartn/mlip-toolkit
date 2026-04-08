@@ -6,6 +6,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from ase.io import read
 
+# --- Import validation logic to prevent duplicate math ---
+try:
+    from md_sim.validation import _get_distance_distribution, _get_angle_distribution
+except ImportError:
+    # Fallback in case the script is run directly in the same folder
+    from validation import _get_distance_distribution, _get_angle_distribution
+
 try:
     from sklearn.metrics import mean_absolute_error
 except ImportError:
@@ -28,22 +35,80 @@ def generate_plots(cfg):
     # 1. Thermodynamics Plots (Temp, Kin/Pot, Tot) with comparisons
     _plot_thermo(cfg, out_dir)
     
-    # 2. RDF Plot (Radial Distribution Function)
-    _plot_rdf(cfg, out_dir)
+    # 2. Structural Overlays (RDF & ADF)
+    trajs_to_plot = {}
+    
+    curr_traj = cfg.get("trajectory_file")
+    if curr_traj and Path(curr_traj).exists():
+        trajs_to_plot["MACE (Current Run)"] = curr_traj
+        
+    ref_traj = cfg.get("reference_traj_file")
+    if ref_traj and Path(ref_traj).exists():
+        trajs_to_plot["AIMD (Reference)"] = ref_traj
+
+    burn_in = cfg.get("validation_burn_in_frames", 800)
+    
+    if trajs_to_plot:
+        _plot_structural_overlay(trajs_to_plot, out_dir / "rdf_overlay.png", mode="RDF", burn_in=burn_in)
+        _plot_structural_overlay(trajs_to_plot, out_dir / "adf_overlay.png", mode="ADF", burn_in=burn_in)
 
     # 3. Parity Plots (Energy/Force Accuracy)
-    ref_traj = cfg.get("reference_traj_file")
-    curr_traj = cfg.get("trajectory_file")
-    
     if ref_traj and Path(ref_traj).exists() and curr_traj and Path(curr_traj).exists():
         plot_parity(ref_traj, curr_traj, str(out_dir / "accuracy_parity"))
     elif ref_traj:
         print(f"Skipping parity plots. Ensure both trajectories exist.\n"
               f"  Ref:  {ref_traj}\n  Pred: {curr_traj}")
+              
     # 2.5 Velocity Histograms (v_x, v_y, v_z at last step)
     atoms_csv = cfg.get("atoms_csv")
     if atoms_csv and Path(atoms_csv).exists():
         _plot_velocity_histogram(atoms_csv, out_dir / "velocity_histogram.png")
+
+def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
+    """Uses validation module logic to overlay RDF or ADF for multiple trajectories."""
+    plt.figure(figsize=(8, 5))
+    
+    if mode == "RDF":
+        rmax, bins = 6.0, 100
+        xlabel, title = "Distance (Å)", "Radial Distribution Function (RDF)"
+        # Recreate the exact bin centers used in validation.py
+        edges = np.linspace(0.1, rmax, bins + 1)
+        centers = (edges[1:] + edges[:-1]) / 2.0
+    else:
+        rcut, bins = 3.0, 90
+        xlabel, title = "Angle (Degrees)", "Angular Distribution Function (ADF)"
+        # Recreate the exact bin centers used in validation.py
+        edges = np.linspace(0, 180, bins + 1)
+        centers = (edges[1:] + edges[:-1]) / 2.0
+
+    for label, path in traj_dict.items():
+        print(f"Calculating {mode} plot for {label}...")
+        try:
+            # We still read every 10th frame to keep plotting fast!
+            frames = read(str(path), index=f"{burn_in}::10")
+            
+            if not frames:
+                continue
+
+            if mode == "RDF":
+                # Calls the logic directly from validation.py
+                prob = _get_distance_distribution(frames, rmax=rmax, bins=bins)
+            else:
+                # Calls the logic directly from validation.py
+                prob = _get_angle_distribution(frames, rcut=rcut, bins=bins)
+
+            plt.plot(centers, prob, label=label, linewidth=2, alpha=0.8)
+        except Exception as e:
+            print(f"Error processing {label}: {e}")
+
+    plt.xlabel(xlabel)
+    plt.ylabel("Probability Density")
+    plt.title(f"{title} (Steps {burn_in}+)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
 
 def _load_data_sources(cfg):
     sources = []
@@ -168,47 +233,6 @@ def _plot_thermo(cfg, out_dir):
         fig_kinpot.tight_layout()
         fig_kinpot.savefig(out_dir / "energies_vs_step.png", dpi=300)
     plt.close(fig_kinpot)
-
-
-def _plot_rdf(cfg, out_dir, rmax=6.0, bins=100):
-    """Calculates and plots a pseudo-RDF from the trajectory."""
-    traj_path = cfg.get("trajectory_file")
-    if not traj_path or not Path(traj_path).exists():
-        return
-        
-    print(f"Calculating RDF from {traj_path}...")
-    try:
-        frames = read(str(traj_path), index="::10") # read every 10th to speed up
-    except Exception as e:
-        print(f"Error reading trajectory for RDF: {e}")
-        return
-
-    if not frames:
-        return
-
-    hists = np.zeros(bins)
-    for frame in frames:
-        dists = frame.get_all_distances(mic=True)
-        dists = dists[np.triu_indices_from(dists, k=1)]
-        h, edges = np.histogram(dists, bins=bins, range=(0.1, rmax))
-        hists += h
-        
-    if np.sum(hists) == 0:
-        return
-        
-    hists = hists / np.sum(hists)
-    r_centers = (edges[1:] + edges[:-1]) / 2.0
-    
-    plt.figure(figsize=(8, 5))
-    plt.plot(r_centers, hists, color='purple', linewidth=2)
-    plt.xlabel("Distance (Å)")
-    plt.ylabel("Probability")
-    plt.title("Radial Distribution Function (Pseudo-RDF)")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / "rdf_plot.png", dpi=300)
-    plt.close()
-
 
 def _get_energy(frame):
     """Robustly extract energy from a frame, checking calculators, results, and info."""

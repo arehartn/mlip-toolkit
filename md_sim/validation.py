@@ -133,12 +133,16 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0):
     res["MSD_Error_A2"] = abs(ref_msd - pred_msd)
 
     # 8. Vibrational Density of States (VDOS) Overlap
-    try:
-        ref_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs)
-        pred_vdos = _calculate_vdos_spectrum(pred_frames, dt_fs)
-        res["EMD_VDOS_Spectrum"] = wasserstein_distance(ref_vdos, pred_vdos)
-    except Exception as e:
-        print(f"Warning: Could not compute VDOS (Check if velocities exist): {e}")
+    # 8. Vibrational Density of States (VDOS) Overlap
+    if cfg.get("run_vdos", False): # Set to False to skip
+        try:
+            ref_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs)
+            pred_vdos = _calculate_vdos_spectrum(pred_frames, dt_fs)
+            res["EMD_VDOS_Spectrum"] = wasserstein_distance(ref_vdos, pred_vdos)
+        except Exception as e:
+            print(f"Warning: Could not compute VDOS: {e}")
+    else:
+        print("Skipping VDOS calculation as requested.")
 
     # Output Results
     print("\n--- Validation Results ---")
