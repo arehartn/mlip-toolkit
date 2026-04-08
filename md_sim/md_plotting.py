@@ -219,8 +219,9 @@ def _plot_thermo(cfg, out_dir):
         p_col = get_col(df, pot_custom, ['energy_pot_eV', 'energy_pot', 'E_pot', 'Potential_Energy', 'PE', 'E_pot_eV', 'epot'])
         
         if k_col and p_col:
-            ax_pot.plot(df[x_col], df[p_col], label=f"{lbl} (Pot)", linestyle=ls, alpha=alpha, linewidth=lw)
-            ax_kin.plot(df[x_col], df[k_col], label=f"{lbl} (Kin)", linestyle=ls, alpha=alpha, linewidth=lw)
+            # Removed the (Pot) and (Kin) from the labels since the axes specify it
+            ax_pot.plot(df[x_col], df[p_col], label=lbl, linestyle=ls, alpha=alpha, linewidth=lw)
+            ax_kin.plot(df[x_col], df[k_col], label=lbl, linestyle=ls, alpha=alpha, linewidth=lw)
             plotted_kinpot = True
 
     # Save Temp Plot
@@ -249,12 +250,14 @@ def _plot_thermo(cfg, out_dir):
     if plotted_kinpot:
         ax_pot.set_ylabel("Potential Energy (eV)")
         ax_pot.set_title("Thermodynamic Energies")
-        ax_pot.legend(loc='upper right')
+        # Set legend to lower left and make text smaller
+        ax_pot.legend(loc='lower left', fontsize='small')
         ax_pot.grid(True, alpha=0.3)
 
         ax_kin.set_ylabel("Kinetic Energy (eV)")
         ax_kin.set_xlabel("Simulation Step")
-        ax_kin.legend(loc='upper right')
+        # Set legend to lower left and make text smaller
+        ax_kin.legend(loc='lower left', fontsize='small')
         ax_kin.grid(True, alpha=0.3)
 
         fig_kinpot.tight_layout()
