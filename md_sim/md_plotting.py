@@ -113,7 +113,7 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
 def _load_data_sources(cfg):
     sources = []
     
-    # 1. Load the primary data (The MACE run you just finished)
+    # 1. Load the primary MACE data
     main_csv = cfg.get("summary_csv")
     if main_csv and Path(main_csv).exists():
         sources.append({
@@ -121,23 +121,30 @@ def _load_data_sources(cfg):
             "label": cfg.get("current_run_label", "Current Run"),
             "linestyle": "-",
             "alpha": 1.0,
-            "linewidth": 2.0  # Make your current run stand out
+            "linewidth": 2.0
         })
 
-    # 2. Load ALL comparisons from the dictionary
-    comparisons = cfg.get("compare_csvs", {})
+    # 2. Load the comparisons
+    comparisons = cfg.get("compare_csvs")
+    
+    # --- THE FIX: If the simulation runner stripped the dict, force it back! ---
+    if not comparisons:
+        print("\n🚨 WARNING: 'compare_csvs' was stripped by the runner! Forcing AIMD data manually...\n")
+        comparisons = {
+            "AIMD": "/users/PAS3201/arehartn/NNOC_MLIP_runs/AIMD_plot_csv/pbe_combined_1705.csv"
+        }
+
     for label, path in comparisons.items():
         if Path(path).exists():
-            try:
-                sources.append({
-                    "df": pd.read_csv(path),
-                    "label": label,
-                    "linestyle": "--",
-                    "alpha": 0.6,     # Make comparisons slightly transparent
-                    "linewidth": 1.0
-                })
-            except Exception as e:
-                print(f"Error loading comparison {label}: {e}")
+            sources.append({
+                "df": pd.read_csv(path),
+                "label": label,
+                "linestyle": "--",
+                "alpha": 0.6,
+                "linewidth": 1.0
+            })
+        else:
+            print(f"\n🚨 CRITICAL ERROR: Could not find the AIMD file at {path}\n")
                 
     return sources
 
