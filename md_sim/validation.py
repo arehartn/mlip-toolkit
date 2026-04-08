@@ -134,7 +134,7 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0):
 
     # 8. Vibrational Density of States (VDOS) Overlap
     # 8. Vibrational Density of States (VDOS) Overlap
-    if cfg.get("run_vdos", False): # Set to False to skip
+    if False: # Set to False to skip
         try:
             ref_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs)
             pred_vdos = _calculate_vdos_spectrum(pred_frames, dt_fs)

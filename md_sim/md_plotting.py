@@ -121,30 +121,48 @@ def _load_data_sources(cfg):
             "label": cfg.get("current_run_label", "Current Run"),
             "linestyle": "-",
             "alpha": 1.0,
-            "linewidth": 2.0
+            "linewidth": 2.0,
+            "color": "black" # Main run gets explicitly colored black
         })
 
-    # 2. Load the comparisons
+    # 2. Load the comparisons (Restored handling for both Lists and Dicts)
     comparisons = cfg.get("compare_csvs")
     
-    # --- THE FIX: If the simulation runner stripped the dict, force it back! ---
     if not comparisons:
         print("\n🚨 WARNING: 'compare_csvs' was stripped by the runner! Forcing AIMD data manually...\n")
         comparisons = {
             "AIMD": "/users/PAS3201/arehartn/NNOC_MLIP_runs/AIMD_plot_csv/pbe_combined_1705.csv"
         }
 
-    for label, path in comparisons.items():
-        if Path(path).exists():
-            sources.append({
-                "df": pd.read_csv(path),
-                "label": label,
-                "linestyle": "--",
-                "alpha": 0.6,
-                "linewidth": 1.0
-            })
-        else:
-            print(f"\n🚨 CRITICAL ERROR: Could not find the AIMD file at {path}\n")
+    # If it's a Dictionary (Custom Label -> File Path)
+    if isinstance(comparisons, dict):
+        for label, path in comparisons.items():
+            if Path(path).exists():
+                sources.append({
+                    "df": pd.read_csv(path),
+                    "label": label,
+                    "linestyle": "--",
+                    "alpha": 0.7,
+                    "linewidth": 1.5,
+                    "color": None # None allows matplotlib to cycle colors automatically
+                })
+            else:
+                print(f"Warning: Compare file {path} not found.")
+                
+    # If it's a List (uses filename as label)
+    elif isinstance(comparisons, list):
+        for path in comparisons:
+            if Path(path).exists():
+                sources.append({
+                    "df": pd.read_csv(path),
+                    "label": Path(path).name,
+                    "linestyle": "--",
+                    "alpha": 0.7,
+                    "linewidth": 1.5,
+                    "color": None # None allows matplotlib to cycle colors automatically
+                })
+            else:
+                print(f"Warning: Compare file {path} not found.")
                 
     return sources
 
@@ -173,34 +191,48 @@ def _plot_thermo(cfg, out_dir):
     for s in sources:
         df = s["df"]
         lbl = s["label"]
-        ls = s["linestyle"]
-        alpha = s["alpha"]
-        lw = s["linewidth"]
+        
+        # Build kwargs dynamically so we don't accidentally force a color
+        plot_kwargs = {
+            "label": lbl,
+            "linestyle": s["linestyle"],
+            "alpha": s["alpha"],
+            "linewidth": s["linewidth"]
+        }
+        if s.get("color"): 
+            plot_kwargs["color"] = s["color"]
 
-        x_col = get_col(df, x_custom, ['step', 'time_ps'])
+        # Expanded column search parties from the old script
+        x_col = get_col(df, x_custom, ['step', 'Step', 'time_ps', 'Time', 'time'])
         if not x_col: continue
 
         # 1. Temp vs Step
-        t_col = get_col(df, temp_custom, ['temperature_K', 'temp_inst_K', 'T'])
+        t_col = get_col(df, temp_custom, ['temperature_K', 'temp_sim_K', 'temp_inst_K', 'Temperature', 'T'])
         if t_col:
-            ax_temp.plot(df[x_col], df[t_col], label=lbl, linestyle=ls, alpha=alpha, linewidth=lw)
+            ax_temp.plot(df[x_col], df[t_col], **plot_kwargs)
             plotted_temp = True
 
         # 2. Total Energy vs Step
-        tot_col = get_col(df, tot_custom, ['energy_tot_eV', 'E_tot_eV', 'energy_eV', 'etot'])
+        tot_col = get_col(df, tot_custom, ['energy_tot_eV', 'E_tot_eV', 'energy_eV', 'etot', 'E_tot', 'Total_Energy'])
         if tot_col:
-            ax_tot.plot(df[x_col], df[tot_col], label=lbl, linestyle=ls, alpha=alpha, linewidth=lw)
+            ax_tot.plot(df[x_col], df[tot_col], **plot_kwargs)
             plotted_tot = True
 
         # 3. Kinetic & Potential Energy (Separate Subplots)
-        k_col = get_col(df, kin_custom, ['energy_kin_eV', 'E_kin_eV', 'ekin'])
-        p_col = get_col(df, pot_custom, ['energy_pot_eV', 'E_pot_eV', 'epot_eV', 'epot'])
+        k_col = get_col(df, kin_custom, ['energy_kin_eV', 'E_kin_eV', 'ekin', 'energy_kin', 'E_kin', 'Kinetic_Energy', 'KE'])
+        p_col = get_col(df, pot_custom, ['energy_pot_eV', 'E_pot_eV', 'epot_eV', 'epot', 'energy_pot', 'E_pot', 'Potential_Energy', 'PE'])
         
         if k_col and p_col:
+            # We copy kwargs so we can inject specific labels
+            pot_kwargs = plot_kwargs.copy()
+            kin_kwargs = plot_kwargs.copy()
+            pot_kwargs["label"] = f"{lbl} (Pot)"
+            kin_kwargs["label"] = f"{lbl} (Kin)"
+            
             # Plot Potential on top subplot
-            ax_pot.plot(df[x_col], df[p_col], label=f"{lbl} (Pot)", linestyle=ls, alpha=alpha, linewidth=lw)
-            # Plot Kinetic on bottom subplot
-            ax_kin.plot(df[x_col], df[k_col], label=f"{lbl} (Kin)", linestyle=ls, alpha=alpha, linewidth=lw, color='orange')
+            ax_pot.plot(df[x_col], df[p_col], **pot_kwargs)
+            # Plot Kinetic on bottom subplot (Removed the hardcoded color='orange')
+            ax_kin.plot(df[x_col], df[k_col], **kin_kwargs)
             plotted_kinpot = True
 
     # Save Temp Plot
