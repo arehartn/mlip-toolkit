@@ -46,29 +46,34 @@ def generate_plots(cfg):
         _plot_velocity_histogram(atoms_csv, out_dir / "velocity_histogram.png")
 
 def _load_data_sources(cfg):
-    """Loads the main run and any comparison CSVs, resolving columns."""
     sources = []
+    
+    # 1. Load the primary data (The MACE run you just finished)
     main_csv = cfg.get("summary_csv")
     if main_csv and Path(main_csv).exists():
         sources.append({
-            "label": cfg.get("current_run_label", "Current Run"),
             "df": pd.read_csv(main_csv),
+            "label": cfg.get("current_run_label", "Current Run"),
             "linestyle": "-",
-            "alpha": 0.9,
-            "linewidth": 2
+            "alpha": 1.0,
+            "linewidth": 2.0  # Make your current run stand out
         })
-    
-    compare_csvs = cfg.get("compare_csvs", {})
-    if isinstance(compare_csvs, dict):
-        for label, path in compare_csvs.items():
-            if Path(path).exists():
+
+    # 2. Load ALL comparisons from the dictionary
+    comparisons = cfg.get("compare_csvs", {})
+    for label, path in comparisons.items():
+        if Path(path).exists():
+            try:
                 sources.append({
-                    "label": label,
                     "df": pd.read_csv(path),
+                    "label": label,
                     "linestyle": "--",
-                    "alpha": 0.7,
-                    "linewidth": 1.5
+                    "alpha": 0.6,     # Make comparisons slightly transparent
+                    "linewidth": 1.0
                 })
+            except Exception as e:
+                print(f"Error loading comparison {label}: {e}")
+                
     return sources
 
 def _plot_thermo(cfg, out_dir):
