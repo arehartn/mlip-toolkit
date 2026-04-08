@@ -78,14 +78,15 @@ def _plot_thermo(cfg, out_dir):
         print("Warning: No valid CSVs found for thermo plots.")
         return
 
-    # Prepare the figures
+    # Create figures for Temp and Total Energy
     fig_temp, ax_temp = plt.subplots(figsize=(10, 6))
     fig_tot, ax_tot = plt.subplots(figsize=(10, 6))
-    fig_kinpot, ax_kinpot = plt.subplots(figsize=(10, 6))
+    
+    # Create one figure with TWO subplots for Kin and Pot
+    fig_kinpot, (ax_pot, ax_kin) = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
 
     plotted_temp = plotted_tot = plotted_kinpot = False
 
-    # Get column preferences from config
     x_custom = cfg.get("custom_x_cols", [])
     temp_custom = cfg.get("custom_temp_cols", [])
     tot_custom = cfg.get("custom_tot_cols", [])
@@ -114,13 +115,15 @@ def _plot_thermo(cfg, out_dir):
             ax_tot.plot(df[x_col], df[tot_col], label=lbl, linestyle=ls, alpha=alpha, linewidth=lw)
             plotted_tot = True
 
-        # 3. Kinetic & Potential Energy vs Step
+        # 3. Kinetic & Potential Energy (Separate Subplots)
         k_col = get_col(df, kin_custom, ['energy_kin_eV', 'E_kin_eV', 'ekin'])
         p_col = get_col(df, pot_custom, ['energy_pot_eV', 'E_pot_eV', 'epot_eV', 'epot'])
         
         if k_col and p_col:
-            ax_kinpot.plot(df[x_col], df[p_col], label=f"{lbl} (Pot)", linestyle=ls, alpha=alpha, linewidth=lw)
-            ax_kinpot.plot(df[x_col], df[k_col], label=f"{lbl} (Kin)", linestyle=':', alpha=alpha, linewidth=lw)
+            # Plot Potential on top subplot
+            ax_pot.plot(df[x_col], df[p_col], label=f"{lbl} (Pot)", linestyle=ls, alpha=alpha, linewidth=lw)
+            # Plot Kinetic on bottom subplot
+            ax_kin.plot(df[x_col], df[k_col], label=f"{lbl} (Kin)", linestyle=ls, alpha=alpha, linewidth=lw, color='orange')
             plotted_kinpot = True
 
     # Save Temp Plot
@@ -145,13 +148,18 @@ def _plot_thermo(cfg, out_dir):
         fig_tot.savefig(out_dir / "tot_energy_vs_step.png", dpi=300)
     plt.close(fig_tot)
 
-    # Save Kin/Pot Plot
+    # Save Kin/Pot Split Plot
     if plotted_kinpot:
-        ax_kinpot.set_xlabel("Simulation Step")
-        ax_kinpot.set_ylabel("Energy (eV)")
-        ax_kinpot.set_title("Kinetic and Potential Energy vs. Simulation Step")
-        ax_kinpot.legend()
-        ax_kinpot.grid(True, alpha=0.3)
+        ax_pot.set_ylabel("Potential Energy (eV)")
+        ax_pot.set_title("Thermodynamic Energies")
+        ax_pot.legend(loc='upper right')
+        ax_pot.grid(True, alpha=0.3)
+
+        ax_kin.set_ylabel("Kinetic Energy (eV)")
+        ax_kin.set_xlabel("Simulation Step")
+        ax_kin.legend(loc='upper right')
+        ax_kin.grid(True, alpha=0.3)
+
         fig_kinpot.tight_layout()
         fig_kinpot.savefig(out_dir / "energies_vs_step.png", dpi=300)
     plt.close(fig_kinpot)
@@ -310,7 +318,7 @@ def plot_parity(true_traj_path, pred_traj_path, output_prefix):
         plt.savefig(f"{output_prefix}_forces.png", dpi=300)
         plt.close()
         print(f"Saved: {output_prefix}_forces.png")
-        
+
 def _plot_velocity_histogram(atoms_csv, out_path):
     """Plots a histogram of velocities to check Maxwell-Boltzmann distribution."""
     if not Path(atoms_csv).exists():
@@ -324,16 +332,26 @@ def _plot_velocity_histogram(atoms_csv, out_path):
     last_step = df['step'].max()
     df_last = df[df['step'] == last_step]
     
-    plt.figure(figsize=(8, 5))
-    plt.hist(df_last['vx'], bins=50, alpha=0.5, label='vx', density=True)
-    plt.hist(df_last['vy'], bins=50, alpha=0.5, label='vy', density=True)
-    plt.hist(df_last['vz'], bins=50, alpha=0.5, label='vz', density=True)
+    # Create 3 subplots stacked vertically with a shared x-axis
+    fig, axes = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
     
-    plt.xlabel("Velocity (Å/fs)")
-    plt.ylabel("Density")
-    plt.title(f"Velocity Distribution at Step {last_step}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Plot configurations for each component
+    components = [
+        ('vx', '$v_x$', 'royalblue'),
+        ('vy', '$v_y$', 'seagreen'),
+        ('vz', '$v_z$', 'indianred')
+    ]
+    
+    for ax, (col, label, color) in zip(axes, components):
+        ax.hist(df_last[col], bins=50, alpha=0.7, color=color, density=True, label=label)
+        ax.set_ylabel("Density")
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+    
+    # Set titles and final labels
+    axes[0].set_title(f"Velocity Component Distributions at Step {last_step}")
+    axes[2].set_xlabel("Velocity ($\text{\AA}$/fs)")
+    
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.close()
