@@ -4,10 +4,10 @@ from pathlib import Path
 from ase.io import read
 from scipy.stats import wasserstein_distance
 from scipy.signal import correlate
+from ase.geometry import find_mic
 
 # --- 1. Structural Utilities ---
 def _get_distance_distribution(frames, rmax=6.0, bins=100):
-    """Calculates pseudo-RDF. Returns (normalized, raw_hist, x_axis)."""
     hists = np.zeros(bins)
     for frame in frames:
         dists = frame.get_all_distances(mic=True)
@@ -20,7 +20,6 @@ def _get_distance_distribution(frames, rmax=6.0, bins=100):
     return norm_hists, hists, x_axis
 
 def _get_angle_distribution(frames, rcut=3.0, bins=90):
-    """Calculates pseudo-ADF. Returns (normalized, raw_hist, x_axis)."""
     hists = np.zeros(bins)
     for frame in frames:
         dists = frame.get_all_distances(mic=True)
@@ -45,22 +44,39 @@ def _get_angle_distribution(frames, rcut=3.0, bins=90):
 
 # --- 2. Dynamical Utilities ---
 def _calculate_msd(frames):
+    """Calculates MSD and returns both the mean and the raw array over time."""
     pos_0 = frames[0].get_positions()
     msds = []
     for frame in frames:
         diff = frame.get_positions() - pos_0
         msds.append(np.mean(np.sum(diff**2, axis=1)))
-    return np.mean(msds)
+    return np.mean(msds), np.array(msds)
 
-def _calculate_vdos_spectrum(frames, dt_fs):
-    """Calculates VDOS. Returns (normalized, raw_vdos, frequencies_THz)."""
+def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
     vels = np.array([f.get_velocities() for f in frames])
     
-    if vels[0] is None:
-        raise ValueError("Velocities not found in trajectory. VDOS cannot be calculated.")
+    # Fallback just in case velocities are missing
+    if vels[0] is None or np.all(vels[0] == 0.0):
+        print("    Warning: Valid velocities not found! Approximating from positions...")
+        steps, atoms = len(frames), len(frames[0])
+        vels = np.zeros((steps, atoms, 3))
+        cell, pbc = frames[0].get_cell(), frames[0].get_pbc()
+        frame_dt = dt_fs * log_interval
         
+        for i in range(steps):
+            if i == 0:
+                delta_r = frames[1].get_positions() - frames[0].get_positions()
+                dt_step = frame_dt
+            elif i == steps - 1:
+                delta_r = frames[-1].get_positions() - frames[-2].get_positions()
+                dt_step = frame_dt
+            else:
+                delta_r = frames[i+1].get_positions() - frames[i-1].get_positions()
+                dt_step = 2 * frame_dt
+            delta_r_mic, _ = find_mic(delta_r, cell, pbc)
+            vels[i] = delta_r_mic / dt_step
+
     steps, atoms, dims = vels.shape
-    
     vacf = np.zeros(steps)
     for i in range(atoms):
         for j in range(dims):
@@ -70,10 +86,7 @@ def _calculate_vdos_spectrum(frames, dt_fs):
             
     vacf = vacf / vacf[0]
     vdos = np.abs(np.fft.rfft(vacf))**2
-    
-    # Calculate Frequency X-Axis in THz
-    # dt_fs is timestep in femtoseconds. Time between frames in seconds = dt_fs * 1e-15
-    freqs_Hz = np.fft.rfftfreq(steps, d=dt_fs * 1e-15)
+    freqs_Hz = np.fft.rfftfreq(steps, d=dt_fs * log_interval * 1e-15)
     freqs_THz = freqs_Hz * 1e-12 
     
     norm_vdos = vdos / np.sum(vdos) if np.sum(vdos) > 0 else vdos
@@ -97,7 +110,7 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     print(f"Validating {len(ref_frames)} AIMD frames vs {len(pred_frames)} MACE frames...")
     
     res = {}
-    raw_data = {} # Dictionary to hold raw data arrays for export
+    raw_data = {}
 
     # 1-2. Energy Distributions
     if cfg.get("run_energy", True):
@@ -109,14 +122,20 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         pred_ekin = np.array([f.get_kinetic_energy() for f in pred_frames]) / n_atoms
         res["EMD_Ekin_eV_atom"] = wasserstein_distance(ref_ekin, pred_ekin)
         
-        raw_data["Ref_Epot_Raw"] = ref_epot
-        raw_data["Pred_Epot_Raw"] = pred_epot
+        raw_data["Ref_Epot_eV_atom"] = ref_epot
+        raw_data["Pred_Epot_eV_atom"] = pred_epot
+        raw_data["Ref_Ekin_eV_atom"] = ref_ekin
+        raw_data["Pred_Ekin_eV_atom"] = pred_ekin
 
     # 3. Force Magnitude Distributions
     if cfg.get("run_forces", True):
         ref_f_mag = np.linalg.norm(np.vstack([f.get_forces() for f in ref_frames]), axis=1)
         pred_f_mag = np.linalg.norm(np.vstack([f.get_forces() for f in pred_frames]), axis=1)
         res["EMD_Forces_eV_A"] = wasserstein_distance(ref_f_mag, pred_f_mag)
+        
+        # This will be a massive array (n_frames * n_atoms) of raw force magnitudes!
+        raw_data["Ref_Force_Mag_eV_A"] = ref_f_mag
+        raw_data["Pred_Force_Mag_eV_A"] = pred_f_mag
 
     # 4. RDF (Radial Distribution Function)
     if cfg.get("run_rdf", True):
@@ -125,8 +144,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         res["EMD_RDF_Structure"] = wasserstein_distance(ref_rdf_norm, pred_rdf_norm)
         
         raw_data["RDF_Distance_Angstrom"] = x_rdf
-        raw_data["RDF_Ref_Raw"] = ref_rdf_raw
-        raw_data["RDF_Pred_Raw"] = pred_rdf_raw
+        raw_data["RDF_Ref_Raw_Counts"] = ref_rdf_raw
+        raw_data["RDF_Pred_Raw_Counts"] = pred_rdf_raw
+        raw_data["RDF_Ref_Norm_Prob"] = ref_rdf_norm
+        raw_data["RDF_Pred_Norm_Prob"] = pred_rdf_norm
 
     # 5. ADF (Angular Distribution Function)
     if cfg.get("run_adf", True):
@@ -135,29 +156,44 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         res["EMD_ADF_Structure"] = wasserstein_distance(ref_adf_norm, pred_adf_norm)
         
         raw_data["ADF_Angle_Degrees"] = x_adf
-        raw_data["ADF_Ref_Raw"] = ref_adf_raw
-        raw_data["ADF_Pred_Raw"] = pred_adf_raw
+        raw_data["ADF_Ref_Raw_Counts"] = ref_adf_raw
+        raw_data["ADF_Pred_Raw_Counts"] = pred_adf_raw
+        raw_data["ADF_Ref_Norm_Prob"] = ref_adf_norm
+        raw_data["ADF_Pred_Norm_Prob"] = pred_adf_norm
 
     # 6. Heat Capacity (Cv) Error
     if cfg.get("run_cv", True):
         ref_epot_tot = np.array([f.get_potential_energy() for f in ref_frames])
         pred_epot_tot = np.array([f.get_potential_energy() for f in pred_frames])
         res["Cv_Error_eV_K_atom"] = abs(np.var(ref_epot_tot) - np.var(pred_epot_tot)) / (kb * temp_k**2 * n_atoms)
+        
+        # Exporting total energies so variance/Cv math can be reverse-engineered
+        raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
+        raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
 
     # 7. Mean Squared Displacement (MSD) Error
     if cfg.get("run_msd", True):
-        res["MSD_Error_A2"] = abs(_calculate_msd(ref_frames) - _calculate_msd(pred_frames))
+        ref_msd_mean, ref_msd_arr = _calculate_msd(ref_frames)
+        pred_msd_mean, pred_msd_arr = _calculate_msd(pred_frames)
+        res["MSD_Error_A2"] = abs(ref_msd_mean - pred_msd_mean)
+        
+        # Exporting the MSD curve over time
+        raw_data["Ref_MSD_vs_Time_A2"] = ref_msd_arr
+        raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
     # 8. Vibrational Density of States (VDOS)
     if cfg.get("run_vdos", False):
         try:
-            ref_vdos_norm, ref_vdos_raw, x_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs)
-            pred_vdos_norm, pred_vdos_raw, _ = _calculate_vdos_spectrum(pred_frames, dt_fs)
+            log_int = cfg.get("log_interval", 1) 
+            ref_vdos_norm, ref_vdos_raw, x_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs, log_interval=log_int)
+            pred_vdos_norm, pred_vdos_raw, _ = _calculate_vdos_spectrum(pred_frames, dt_fs, log_interval=log_int)
             res["EMD_VDOS_Spectrum"] = wasserstein_distance(ref_vdos_norm, pred_vdos_norm)
             
             raw_data["VDOS_Freq_THz"] = x_vdos
-            raw_data["VDOS_Ref_Raw"] = ref_vdos_raw
-            raw_data["VDOS_Pred_Raw"] = pred_vdos_raw
+            raw_data["VDOS_Ref_Raw_Intensity"] = ref_vdos_raw
+            raw_data["VDOS_Pred_Raw_Intensity"] = pred_vdos_raw
+            raw_data["VDOS_Ref_Norm_Prob"] = ref_vdos_norm
+            raw_data["VDOS_Pred_Norm_Prob"] = pred_vdos_norm
         except Exception as e:
             print(f"Warning: Could not compute VDOS: {e}")
 
@@ -168,11 +204,11 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         
     # --- EXPORT RAW DATA TO CSV ---
     if raw_data:
-        # We use pd.Series so pandas doesn't crash from columns having different row lengths
+        # Wrap everything in pd.Series so arrays of different lengths don't crash Pandas
         raw_df = pd.DataFrame({k: pd.Series(v) for k, v in raw_data.items()})
         raw_csv_path = str(cfg.get("validation_output_csv", "validation_results.csv")).replace(".csv", "_RAW_DATA.csv")
         raw_df.to_csv(raw_csv_path, index=False)
-        print(f"Saved raw distributional data to {raw_csv_path}")
+        print(f"Saved ALL raw distributional data to {raw_csv_path}")
 
     return res
 
@@ -189,13 +225,12 @@ def run(config_overrides=None):
     dt = cfg.get("dt_fs", 1.0)
     burn_in = cfg.get("validation_burn_in_frames", 0)
 
-    # Note: We now pass `cfg` into validate_trajectories!
     results = validate_trajectories(ref_traj, pred_traj, temp, dt, burn_in, cfg)
 
     if results:
         df = pd.DataFrame([results])
         df.to_csv(out_csv, index=False)
-        print(f"Saved scalar EMD results to {out_csv}")
+        print(f"Saved scalar validation metrics to {out_csv}")
     
     return results
 
