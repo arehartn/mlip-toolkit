@@ -5,6 +5,7 @@ from ase.io import read
 from scipy.stats import wasserstein_distance
 from scipy.signal import correlate
 from ase.geometry import find_mic
+from scipy.signal.windows import hann
 
 # --- 1. Structural Utilities ---
 def _get_distance_distribution(frames, rmax=6.0, bins=100):
@@ -44,13 +45,31 @@ def _get_angle_distribution(frames, rcut=3.0, bins=90):
 
 # --- 2. Dynamical Utilities ---
 def _calculate_msd(frames):
-    """Calculates MSD and returns both the mean and the raw array over time."""
-    pos_0 = frames[0].get_positions()
-    msds = []
-    for frame in frames:
-        diff = frame.get_positions() - pos_0
-        msds.append(np.mean(np.sum(diff**2, axis=1)))
-    return np.mean(msds), np.array(msds)
+    """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
+    # 1. Extract and unwrap positions so boundary jumps don't ruin the distance math
+    positions = np.array([f.get_positions() for f in frames])
+    cell = frames[0].get_cell()
+    
+    # Simple unwrapping algorithm (assumes continuous frames)
+    for i in range(1, len(positions)):
+        # Find the jump from the previous frame
+        delta = positions[i] - positions[i-1]
+        # If the jump is larger than half the box size, it crossed a boundary! Shift it back.
+        positions[i] -= np.round(delta / cell.lengths()) * cell.lengths()
+
+    n_frames, n_atoms, _ = positions.shape
+    msd_arr = np.zeros(n_frames)
+    
+    # 2. Multiple Time Origins (Rolling Window)
+    # We average the displacement over ALL possible starting times to get a smooth curve
+    for lag in range(1, n_frames):
+        # Difference between positions separated by 'lag' frames
+        diff = positions[lag:] - positions[:-lag]
+        # Square the distances, average over all atoms and all starting frames for this lag
+        sq_dist = np.sum(diff**2, axis=-1)
+        msd_arr[lag] = np.mean(sq_dist)
+        
+    return np.mean(msd_arr), msd_arr
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
     vels = np.array([f.get_velocities() for f in frames])
@@ -84,14 +103,23 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
             corr = correlate(v, v, mode='full')
             vacf += corr[steps-1:] / np.arange(steps, 0, -1)
             
+    # Normalize VACF so it starts at 1.0
     vacf = vacf / vacf[0]
-    vdos = np.abs(np.fft.rfft(vacf))**2
+    
+    # --- LITERATURE STANDARD WINDOWING ---
+    # We apply a Hann half-window to smoothly taper the tail end of the VACF to zero
+    window = hann(steps * 2)[steps:] 
+    vacf_windowed = vacf * window
+    
+    # Fourier Transform the *windowed* VACF (using magnitude, standard practice)
+    vdos = np.abs(np.fft.rfft(vacf_windowed))
+    
     freqs_Hz = np.fft.rfftfreq(steps, d=dt_fs * log_interval * 1e-15)
     freqs_THz = freqs_Hz * 1e-12 
     
     norm_vdos = vdos / np.sum(vdos) if np.sum(vdos) > 0 else vdos
     return norm_vdos, vdos, freqs_THz
-
+    
 # --- 3. Main Validation Engine ---
 def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=None):
     if cfg is None: cfg = {}
@@ -133,7 +161,6 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         pred_f_mag = np.linalg.norm(np.vstack([f.get_forces() for f in pred_frames]), axis=1)
         res["EMD_Forces_eV_A"] = wasserstein_distance(ref_f_mag, pred_f_mag)
         
-        # This will be a massive array (n_frames * n_atoms) of raw force magnitudes!
         raw_data["Ref_Force_Mag_eV_A"] = ref_f_mag
         raw_data["Pred_Force_Mag_eV_A"] = pred_f_mag
 
@@ -141,7 +168,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     if cfg.get("run_rdf", True):
         ref_rdf_norm, ref_rdf_raw, x_rdf = _get_distance_distribution(ref_frames)
         pred_rdf_norm, pred_rdf_raw, _ = _get_distance_distribution(pred_frames)
-        res["EMD_RDF_Structure"] = wasserstein_distance(ref_rdf_norm, pred_rdf_norm)
+        
+        # Calculate BOTH Normalized and Raw EMD
+        res["EMD_RDF_Structure_Norm"] = wasserstein_distance(ref_rdf_norm, pred_rdf_norm)
+        res["EMD_RDF_Structure_Raw"] = wasserstein_distance(ref_rdf_raw, pred_rdf_raw)
         
         raw_data["RDF_Distance_Angstrom"] = x_rdf
         raw_data["RDF_Ref_Raw_Counts"] = ref_rdf_raw
@@ -153,7 +183,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     if cfg.get("run_adf", True):
         ref_adf_norm, ref_adf_raw, x_adf = _get_angle_distribution(ref_frames)
         pred_adf_norm, pred_adf_raw, _ = _get_angle_distribution(pred_frames)
-        res["EMD_ADF_Structure"] = wasserstein_distance(ref_adf_norm, pred_adf_norm)
+        
+        # Calculate BOTH Normalized and Raw EMD
+        res["EMD_ADF_Structure_Norm"] = wasserstein_distance(ref_adf_norm, pred_adf_norm)
+        res["EMD_ADF_Structure_Raw"] = wasserstein_distance(ref_adf_raw, pred_adf_raw)
         
         raw_data["ADF_Angle_Degrees"] = x_adf
         raw_data["ADF_Ref_Raw_Counts"] = ref_adf_raw
@@ -167,7 +200,6 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         pred_epot_tot = np.array([f.get_potential_energy() for f in pred_frames])
         res["Cv_Error_eV_K_atom"] = abs(np.var(ref_epot_tot) - np.var(pred_epot_tot)) / (kb * temp_k**2 * n_atoms)
         
-        # Exporting total energies so variance/Cv math can be reverse-engineered
         raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
         raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
 
@@ -177,7 +209,6 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         pred_msd_mean, pred_msd_arr = _calculate_msd(pred_frames)
         res["MSD_Error_A2"] = abs(ref_msd_mean - pred_msd_mean)
         
-        # Exporting the MSD curve over time
         raw_data["Ref_MSD_vs_Time_A2"] = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
@@ -187,7 +218,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             log_int = cfg.get("log_interval", 1) 
             ref_vdos_norm, ref_vdos_raw, x_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs, log_interval=log_int)
             pred_vdos_norm, pred_vdos_raw, _ = _calculate_vdos_spectrum(pred_frames, dt_fs, log_interval=log_int)
-            res["EMD_VDOS_Spectrum"] = wasserstein_distance(ref_vdos_norm, pred_vdos_norm)
+            
+            # Calculate BOTH Normalized and Raw EMD
+            res["EMD_VDOS_Spectrum_Norm"] = wasserstein_distance(ref_vdos_norm, pred_vdos_norm)
+            res["EMD_VDOS_Spectrum_Raw"] = wasserstein_distance(ref_vdos_raw, pred_vdos_raw)
             
             raw_data["VDOS_Freq_THz"] = x_vdos
             raw_data["VDOS_Ref_Raw_Intensity"] = ref_vdos_raw
@@ -200,11 +234,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     # Print Scalar Results
     print("\n--- Validation Results ---")
     for k, v in res.items():
-        print(f"{k:25s}: {v:.6f}")
+        print(f"{k:30s}: {v:.6f}")
         
     # --- EXPORT RAW DATA TO CSV ---
     if raw_data:
-        # Wrap everything in pd.Series so arrays of different lengths don't crash Pandas
         raw_df = pd.DataFrame({k: pd.Series(v) for k, v in raw_data.items()})
         raw_csv_path = str(cfg.get("validation_output_csv", "validation_results.csv")).replace(".csv", "_RAW_DATA.csv")
         raw_df.to_csv(raw_csv_path, index=False)
