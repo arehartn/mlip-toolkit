@@ -71,33 +71,31 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
     if mode == "RDF":
         rmax, bins = 6.0, 100
         xlabel, title = "Distance (Å)", "Radial Distribution Function (RDF)"
-        # Recreate the exact bin centers used in validation.py
-        edges = np.linspace(0.1, rmax, bins + 1)
-        centers = (edges[1:] + edges[:-1]) / 2.0
     else:
         rcut, bins = 3.0, 90
         xlabel, title = "Angle (Degrees)", "Angular Distribution Function (ADF)"
-        # Recreate the exact bin centers used in validation.py
-        edges = np.linspace(0, 180, bins + 1)
-        centers = (edges[1:] + edges[:-1]) / 2.0
 
     for label, path in traj_dict.items():
         print(f"Calculating {mode} plot for {label}...")
         try:
-            # We still read every 10th frame to keep plotting fast!
+            # We read every 10th frame to keep plotting fast
             frames = read(str(path), index=f"{burn_in}::10")
             
             if not frames:
                 continue
 
             if mode == "RDF":
-                # Calls the logic directly from validation.py
-                prob = _get_distance_distribution(frames, rmax=rmax, bins=bins)
+                # PROPER UNPACKING: Grab normalized probability and the x-axis
+                prob, _, centers = _get_distance_distribution(frames, rmax=rmax, bins=bins)
             else:
-                # Calls the logic directly from validation.py
-                prob = _get_angle_distribution(frames, rcut=rcut, bins=bins)
+                prob, _, centers = _get_angle_distribution(frames, rcut=rcut, bins=bins)
 
             plt.plot(centers, prob, label=label, linewidth=2, alpha=0.8)
+            
+            # Optional: Add a subtle fill under the reference trajectory to make it look nicer
+            if "Reference" in label or "AIMD" in label:
+                plt.fill_between(centers, prob, alpha=0.2)
+                
         except Exception as e:
             print(f"Error processing {label}: {e}")
 
@@ -106,6 +104,14 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
     plt.title(f"{title} (Steps {burn_in}+)")
     plt.legend()
     plt.grid(True, alpha=0.3)
+    
+    # Clean up the axes boundaries
+    if mode == "RDF":
+        plt.xlim(0, rmax)
+    else:
+        plt.xlim(0, 180)
+    plt.ylim(0, None)
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
