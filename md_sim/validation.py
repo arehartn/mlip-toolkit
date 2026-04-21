@@ -29,7 +29,11 @@ def _get_angle_distribution(frames, rcut=3.0, bins=90):
             if len(neighbors) < 2: continue
             
             vecs = frame.positions[neighbors] - frame.positions[i]
-            vecs = vecs - np.round(vecs / frame.cell.lengths()) * frame.cell.lengths()
+            
+            # Fix: Use ASE's robust MIC instead of manual array division
+            if any(frame.pbc):
+                vecs, _ = find_mic(vecs, frame.cell, frame.pbc)
+                
             norms = np.linalg.norm(vecs, axis=1)
             vecs = vecs / norms[:, np.newaxis]
             

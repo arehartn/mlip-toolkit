@@ -78,21 +78,25 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
     for label, path in traj_dict.items():
         print(f"Calculating {mode} plot for {label}...")
         try:
-            # We read every 10th frame to keep plotting fast
-            frames = read(str(path), index=f"{burn_in}::10")
+            # Fix: Read all frames safely first to avoid IndexError on short runs
+            full_traj = read(str(path), index=":")
+            if not full_traj:
+                continue
+            
+            # Dynamic burn-in: if trajectory is too short, just burn the first half
+            actual_burn = burn_in if burn_in < len(full_traj) else max(0, len(full_traj) // 2)
+            frames = full_traj[actual_burn::10]
             
             if not frames:
                 continue
 
             if mode == "RDF":
-                # PROPER UNPACKING: Grab normalized probability and the x-axis
                 prob, _, centers = _get_distance_distribution(frames, rmax=rmax, bins=bins)
             else:
                 prob, _, centers = _get_angle_distribution(frames, rcut=rcut, bins=bins)
 
             plt.plot(centers, prob, label=label, linewidth=2, alpha=0.8)
             
-            # Optional: Add a subtle fill under the reference trajectory to make it look nicer
             if "Reference" in label or "AIMD" in label:
                 plt.fill_between(centers, prob, alpha=0.2)
                 
@@ -105,7 +109,6 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    # Clean up the axes boundaries
     if mode == "RDF":
         plt.xlim(0, rmax)
     else:
@@ -393,14 +396,11 @@ def _plot_velocity_histogram(atoms_csv, out_path):
     if not all(col in df.columns for col in ['vx', 'vy', 'vz']):
         return
         
-    # Get velocities of the last step to check equilibration
     last_step = df['step'].max()
     df_last = df[df['step'] == last_step]
     
-    # Create 3 subplots stacked vertically with a shared x-axis
     fig, axes = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
     
-    # Plot configurations for each component
     components = [
         ('vx', '$v_x$', 'royalblue'),
         ('vy', '$v_y$', 'seagreen'),
@@ -413,9 +413,9 @@ def _plot_velocity_histogram(atoms_csv, out_path):
         ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3)
     
-    # Set titles and final labels
     axes[0].set_title(f"Velocity Component Distributions at Step {last_step}")
-    axes[2].set_xlabel("Velocity ($\text{\AA}$/fs)")
+    # Fix: Removed LaTeX \text to prevent Matplotlib crashing
+    axes[2].set_xlabel("Velocity (Å/fs)") 
     
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
