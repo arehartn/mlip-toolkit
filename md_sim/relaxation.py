@@ -8,7 +8,7 @@ DEFAULT_PARAMS = {
     "input_structure": "POSCAR",
     "model_type": "mace",
     "model_variant": "large",
-    "device": "cpu",
+    "device": "cpu" ,
     "fmax": 0.01,
     "output_prefix": "relaxed_structure",
 }

@@ -55,15 +55,22 @@ def run(config_overrides=None):
     )
 
     # 5. Initialize Physics
-    md_tools.initialize_velocities(atoms, cfg["temp_kelvin"])
+    md_tools.initialize_velocities(
+        atoms,
+        cfg["temp_kelvin"],
+        stationary=cfg.get("stationary", True),
+        zero_rotation=cfg.get("zero_rotation", False),
+    )
 
-    # 6. Setup Dynamics Engine (The Thermostat)
-    # Passed the specific arguments that md_tools expects
+    if cfg.get("fix_com", False):
+        md_tools.apply_fix_com(atoms)
+        print("Center-of-mass constraint (FixCom) applied.")
+
     dyn = md_tools.setup_dynamics(
         atoms=atoms,
         temperature_K=cfg["temp_kelvin"],
         dt_fs=cfg["dt_fs"],
-        friction=cfg["friction"]
+        friction=cfg["friction"],
     )
 
     # 7. Attach Logger

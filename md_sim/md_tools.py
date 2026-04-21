@@ -4,8 +4,19 @@ from ase import units
 from ase.io import read, write
 from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from ase import units
+from ase.md.velocitydistribution import (
+    MaxwellBoltzmannDistribution,
+    Stationary,
+    ZeroRotation,
+)
+
+try:
+    from ase.constraints import FixCom
+except ImportError:
+    try:
+        from ase.constraints.fixcom import FixCom
+    except ImportError:
+        FixCom = None
 
 
 # Inside md_tools.py
@@ -49,9 +60,19 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
     atoms.calc = calc
     return atoms
 
-def initialize_velocities(atoms, temperature_K):
+def initialize_velocities(atoms, temperature_K, stationary=True, zero_rotation=False):
+    """Initialize velocities from a Maxwell-Boltzmann distribution.
+
+    stationary    : zero net linear momentum at t=0 (default True).
+    zero_rotation : zero net angular momentum at t=0. Recommended for
+                    isolated molecules/clusters; usually leave False
+                    for periodic crystals.
+    """
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K)
-    Stationary(atoms)
+    if stationary:
+        Stationary(atoms)
+    if zero_rotation:
+        ZeroRotation(atoms)
 
 def setup_dynamics(atoms, temperature_K, dt_fs, friction):
     dyn = Langevin(atoms,
@@ -60,6 +81,15 @@ def setup_dynamics(atoms, temperature_K, dt_fs, friction):
                    friction=friction)
     return dyn
 
+def apply_fix_com(atoms):
+    """Attach an ASE FixCom constraint so the center of mass stays
+    fixed throughout the dynamics (subtracts COM motion every step)."""
+    constraints = list(atoms.constraints) if atoms.constraints else []
+    if not any(isinstance(c, FixCom) for c in constraints):
+        constraints.append(FixCom())
+        atoms.set_constraint(constraints)
+    return atoms
+    
 class MDLogger:
     def __init__(self, atoms, dynamics, params):
         self.atoms = atoms

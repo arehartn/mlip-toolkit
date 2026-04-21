@@ -21,6 +21,11 @@ PARAMS = {
     "atoms_csv": Path("md_atoms.csv"),
     "trajectory_file": "large_traj.traj",
 
+        # COM / momentum control
+    "stationary": True,      # zero net linear momentum at t=0
+    "zero_rotation": False,  # zero net angular momentum at t=0 (clusters/molecules)
+    "fix_com": True,        # FixCom constraint: keep COM fixed during dynamics
+
     "make_plots": False,
     "compare_csvs": [],
     "run_validation": False,
