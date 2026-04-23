@@ -9,71 +9,102 @@ from scipy.signal.windows import hann
 
 # --- 1. Structural Utilities ---
 def _get_distance_distribution(frames, rmax=6.0, bins=100):
+    """Compute the radial distribution function g(r).
+
+    Returns g(r) normalized so that g(r) → 1 at large r for a homogeneous
+    liquid/solid (standard literature definition).  The second return value is
+    the raw histogram counts for archiving.
+    """
+    n_atoms = len(frames[0])
+    n_frames = len(frames)
+    volume = frames[0].get_volume()  # assumed constant (NVT)
+
+    bin_edges = np.linspace(0.1, rmax, bins + 1)
+    r_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    dr = bin_edges[1] - bin_edges[0]
+
     hists = np.zeros(bins)
     for frame in frames:
         dists = frame.get_all_distances(mic=True)
         dists = dists[np.triu_indices_from(dists, k=1)]
-        h, _ = np.histogram(dists, bins=bins, range=(0.1, rmax))
+        h, _ = np.histogram(dists, bins=bin_edges)
         hists += h
-    
-    x_axis = np.linspace(0.1, rmax, bins)
-    norm_hists = hists / np.sum(hists) if np.sum(hists) > 0 else hists
-    return norm_hists, hists, x_axis
+
+    # g(r) = n(r) / [N_frames * N_pairs * rho * 4*pi*r^2 * dr]
+    # where N_pairs = N*(N-1)/2 (unique pairs, upper-triangle convention)
+    # and rho = N/V is the number density.
+    # For a perfectly uniform density this gives g(r) = 1 at every r.
+    n_pairs = n_atoms * (n_atoms - 1) / 2
+    rho = n_atoms / volume
+    ideal_counts = n_frames * n_pairs * rho * 4.0 * np.pi * r_centers**2 * dr
+    with np.errstate(invalid='ignore', divide='ignore'):
+        g_r = np.where(ideal_counts > 0, hists / ideal_counts, 0.0)
+
+    return g_r, hists, r_centers
 
 def _get_angle_distribution(frames, rcut=3.0, bins=90):
+    """Compute the bond-angle distribution function (ADF).
+
+    Returns a probability mass function (PMF) over angle bins, normalised so
+    the values sum to 1.  Bin centres are computed correctly as mid-points of
+    the histogram edges.
+    """
+    bin_edges = np.linspace(0, 180, bins + 1)
+    angle_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
     hists = np.zeros(bins)
     for frame in frames:
         dists = frame.get_all_distances(mic=True)
         for i in range(len(frame)):
             neighbors = np.where((dists[i] < rcut) & (dists[i] > 0.1))[0]
-            if len(neighbors) < 2: continue
-            
+            if len(neighbors) < 2:
+                continue
+
             vecs = frame.positions[neighbors] - frame.positions[i]
-            
-            # Fix: Use ASE's robust MIC instead of manual array division
+
             if any(frame.pbc):
                 vecs, _ = find_mic(vecs, frame.cell, frame.pbc)
-                
+
             norms = np.linalg.norm(vecs, axis=1)
             vecs = vecs / norms[:, np.newaxis]
-            
+
             cos_angles = np.clip(np.dot(vecs, vecs.T), -1.0, 1.0)
             angles = np.arccos(cos_angles[np.triu_indices_from(cos_angles, k=1)])
-            
-            h, _ = np.histogram(np.degrees(angles), bins=bins, range=(0, 180))
+
+            h, _ = np.histogram(np.degrees(angles), bins=bin_edges)
             hists += h
-            
-    x_axis = np.linspace(0, 180, bins)
+
     norm_hists = hists / np.sum(hists) if np.sum(hists) > 0 else hists
-    return norm_hists, hists, x_axis
+    return norm_hists, hists, angle_centers
 
 # --- 2. Dynamical Utilities ---
 def _calculate_msd(frames):
     """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
-    # 1. Extract and unwrap positions so boundary jumps don't ruin the distance math
     positions = np.array([f.get_positions() for f in frames])
-    cell = frames[0].get_cell()
-    
-    # Simple unwrapping algorithm (assumes continuous frames)
-    for i in range(1, len(positions)):
-        # Find the jump from the previous frame
-        delta = positions[i] - positions[i-1]
-        # If the jump is larger than half the box size, it crossed a boundary! Shift it back.
-        positions[i] -= np.round(delta / cell.lengths()) * cell.lengths()
+    cell_matrix = frames[0].get_cell().array  # 3×3, rows are lattice vectors
+
+    # Unwrap in fractional (scaled) coordinates so triclinic cells are handled
+    # correctly.  Cartesian unwrapping with cell.lengths() only works for
+    # orthogonal boxes; for any non-orthogonal cell it produces wrong jumps.
+    inv_cell = np.linalg.inv(cell_matrix)
+    scaled = positions @ inv_cell.T  # (n_frames, n_atoms, 3)
+    for i in range(1, len(scaled)):
+        delta_frac = scaled[i] - scaled[i - 1]
+        scaled[i] -= np.round(delta_frac)
+    positions = scaled @ cell_matrix.T  # back to Cartesian
 
     n_frames, n_atoms, _ = positions.shape
+    # lag=0 is trivially 0 by definition; allocate length n_frames but only
+    # fill lags 1..n_frames-1 (lag 0 stays 0 as a placeholder for the curve).
     msd_arr = np.zeros(n_frames)
-    
-    # 2. Multiple Time Origins (Rolling Window)
-    # We average the displacement over ALL possible starting times to get a smooth curve
     for lag in range(1, n_frames):
-        # Difference between positions separated by 'lag' frames
         diff = positions[lag:] - positions[:-lag]
-        # Square the distances, average over all atoms and all starting frames for this lag
         sq_dist = np.sum(diff**2, axis=-1)
         msd_arr[lag] = np.mean(sq_dist)
-        
-    return np.mean(msd_arr), msd_arr
+
+    # Exclude the trivially-zero lag=0 entry from the summary scalar so it
+    # does not bias the mean toward zero.
+    return np.mean(msd_arr[1:]), msd_arr
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
     vels = np.array([f.get_velocities() for f in frames])
@@ -108,15 +139,23 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
             vacf += corr[steps-1:] / np.arange(steps, 0, -1)
             
     # Normalize VACF so it starts at 1.0
+    if vacf[0] == 0.0:
+        raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
     vacf = vacf / vacf[0]
-    
-    # --- LITERATURE STANDARD WINDOWING ---
-    # We apply a Hann half-window to smoothly taper the tail end of the VACF to zero
-    window = hann(steps * 2)[steps:] 
+
+    # Half-Hann window: take the right half of an odd-length full window.
+    # hann(2N-1)[N-1:] starts at exactly 1.0 (the peak) and ends at exactly
+    # 0.0, giving a smooth taper with no amplitude distortion at lag=0.
+    # Using hann(2N)[N:] is a common mistake — its first sample is ≈0.9998,
+    # not 1.0, and gets worse for short trajectories.
+    window = hann(2 * steps - 1)[steps - 1:]
     vacf_windowed = vacf * window
-    
-    # Fourier Transform the *windowed* VACF (using magnitude, standard practice)
-    vdos = np.abs(np.fft.rfft(vacf_windowed))
+
+    # The VACF is real and symmetric so by the Wiener–Khinchin theorem its
+    # Fourier transform is real and non-negative.  Use np.real + clip(0)
+    # rather than np.abs, which would inflate tiny negative numerical artefacts
+    # at high frequencies into spurious positive spectral density.
+    vdos = np.fft.rfft(vacf_windowed).real.clip(0)
     
     freqs_Hz = np.fft.rfftfreq(steps, d=dt_fs * log_interval * 1e-15)
     freqs_THz = freqs_Hz * 1e-12 
@@ -146,18 +185,30 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
     # 1-2. Energy Distributions
     if cfg.get("run_energy", True):
-        ref_epot = np.array([f.get_potential_energy() for f in ref_frames]) / n_atoms
-        pred_epot = np.array([f.get_potential_energy() for f in pred_frames]) / n_atoms
+        ref_epot_total = np.array([f.get_potential_energy() for f in ref_frames])
+        pred_epot_total = np.array([f.get_potential_energy() for f in pred_frames])
+        ref_epot = ref_epot_total / n_atoms
+        pred_epot = pred_epot_total / n_atoms
+        # Per-atom EMD (dimensionless scale-invariant comparison)
         res["EMD_Epot_eV_atom"] = wasserstein_distance(ref_epot, pred_epot)
+        # Raw total-energy EMD: result has units of eV (same as the quantity being compared)
+        res["EMD_Epot_eV_raw"] = wasserstein_distance(ref_epot_total, pred_epot_total)
 
-        ref_ekin = np.array([f.get_kinetic_energy() for f in ref_frames]) / n_atoms
-        pred_ekin = np.array([f.get_kinetic_energy() for f in pred_frames]) / n_atoms
+        ref_ekin_total = np.array([f.get_kinetic_energy() for f in ref_frames])
+        pred_ekin_total = np.array([f.get_kinetic_energy() for f in pred_frames])
+        ref_ekin = ref_ekin_total / n_atoms
+        pred_ekin = pred_ekin_total / n_atoms
         res["EMD_Ekin_eV_atom"] = wasserstein_distance(ref_ekin, pred_ekin)
-        
+        res["EMD_Ekin_eV_raw"] = wasserstein_distance(ref_ekin_total, pred_ekin_total)
+
         raw_data["Ref_Epot_eV_atom"] = ref_epot
         raw_data["Pred_Epot_eV_atom"] = pred_epot
+        raw_data["Ref_Epot_eV_total"] = ref_epot_total
+        raw_data["Pred_Epot_eV_total"] = pred_epot_total
         raw_data["Ref_Ekin_eV_atom"] = ref_ekin
         raw_data["Pred_Ekin_eV_atom"] = pred_ekin
+        raw_data["Ref_Ekin_eV_total"] = ref_ekin_total
+        raw_data["Pred_Ekin_eV_total"] = pred_ekin_total
 
     # 3. Force Magnitude Distributions
     if cfg.get("run_forces", True):
@@ -170,28 +221,35 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
     # 4. RDF (Radial Distribution Function)
     if cfg.get("run_rdf", True):
-        ref_rdf_norm, ref_rdf_raw, x_rdf = _get_distance_distribution(ref_frames)
-        pred_rdf_norm, pred_rdf_raw, _ = _get_distance_distribution(pred_frames)
-        
-        # Calculate BOTH Normalized and Raw EMD
-        res["EMD_RDF_Structure_Norm"] = wasserstein_distance(ref_rdf_norm, pred_rdf_norm)
-        res["EMD_RDF_Structure_Raw"] = wasserstein_distance(ref_rdf_raw, pred_rdf_raw)
-        
+        ref_rdf_g, ref_rdf_raw, x_rdf = _get_distance_distribution(ref_frames)
+        pred_rdf_g, pred_rdf_raw, _ = _get_distance_distribution(pred_frames)
+
+        # Normalise g(r) to a PMF to use as weights for the Wasserstein distance.
+        # The result has units of Angstroms: the average distance probability mass
+        # must be transported to transform the reference g(r) into the predicted one.
+        ref_rdf_pmf = ref_rdf_g / np.sum(ref_rdf_g) if np.sum(ref_rdf_g) > 0 else ref_rdf_g
+        pred_rdf_pmf = pred_rdf_g / np.sum(pred_rdf_g) if np.sum(pred_rdf_g) > 0 else pred_rdf_g
+        res["EMD_RDF_Angstrom"] = wasserstein_distance(
+            x_rdf, x_rdf, u_weights=ref_rdf_pmf, v_weights=pred_rdf_pmf
+        )
+
         raw_data["RDF_Distance_Angstrom"] = x_rdf
         raw_data["RDF_Ref_Raw_Counts"] = ref_rdf_raw
         raw_data["RDF_Pred_Raw_Counts"] = pred_rdf_raw
-        raw_data["RDF_Ref_Norm_Prob"] = ref_rdf_norm
-        raw_data["RDF_Pred_Norm_Prob"] = pred_rdf_norm
+        raw_data["RDF_Ref_g_r"] = ref_rdf_g
+        raw_data["RDF_Pred_g_r"] = pred_rdf_g
 
     # 5. ADF (Angular Distribution Function)
     if cfg.get("run_adf", True):
         ref_adf_norm, ref_adf_raw, x_adf = _get_angle_distribution(ref_frames)
         pred_adf_norm, pred_adf_raw, _ = _get_angle_distribution(pred_frames)
-        
-        # Calculate BOTH Normalized and Raw EMD
-        res["EMD_ADF_Structure_Norm"] = wasserstein_distance(ref_adf_norm, pred_adf_norm)
-        res["EMD_ADF_Structure_Raw"] = wasserstein_distance(ref_adf_raw, pred_adf_raw)
-        
+
+        # EMD with bin-centre positions as the 1D support.
+        # Result has units of degrees.
+        res["EMD_ADF_Degrees"] = wasserstein_distance(
+            x_adf, x_adf, u_weights=ref_adf_norm, v_weights=pred_adf_norm
+        )
+
         raw_data["ADF_Angle_Degrees"] = x_adf
         raw_data["ADF_Ref_Raw_Counts"] = ref_adf_raw
         raw_data["ADF_Pred_Raw_Counts"] = pred_adf_raw
@@ -223,9 +281,11 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             ref_vdos_norm, ref_vdos_raw, x_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs, log_interval=log_int)
             pred_vdos_norm, pred_vdos_raw, _ = _calculate_vdos_spectrum(pred_frames, dt_fs, log_interval=log_int)
             
-            # Calculate BOTH Normalized and Raw EMD
-            res["EMD_VDOS_Spectrum_Norm"] = wasserstein_distance(ref_vdos_norm, pred_vdos_norm)
-            res["EMD_VDOS_Spectrum_Raw"] = wasserstein_distance(ref_vdos_raw, pred_vdos_raw)
+            # EMD with frequency bin positions as the 1D support.
+            # Result has units of THz.
+            res["EMD_VDOS_THz"] = wasserstein_distance(
+                x_vdos, x_vdos, u_weights=ref_vdos_norm, v_weights=pred_vdos_norm
+            )
             
             raw_data["VDOS_Freq_THz"] = x_vdos
             raw_data["VDOS_Ref_Raw_Intensity"] = ref_vdos_raw

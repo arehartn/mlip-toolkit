@@ -70,47 +70,48 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800):
     
     if mode == "RDF":
         rmax, bins = 6.0, 100
-        xlabel, title = "Distance (Å)", "Radial Distribution Function (RDF)"
+        xlabel, title = "Distance (Å)", "Radial Distribution Function g(r)"
+        ylabel = "g(r)"
     else:
         rcut, bins = 3.0, 90
         xlabel, title = "Angle (Degrees)", "Angular Distribution Function (ADF)"
+        ylabel = "Probability Density"
 
     for label, path in traj_dict.items():
         print(f"Calculating {mode} plot for {label}...")
         try:
-            # Fix: Read all frames safely first to avoid IndexError on short runs
             full_traj = read(str(path), index=":")
             if not full_traj:
                 continue
-            
-            # Dynamic burn-in: if trajectory is too short, just burn the first half
+
             actual_burn = burn_in if burn_in < len(full_traj) else max(0, len(full_traj) // 2)
             frames = full_traj[actual_burn::10]
-            
+
             if not frames:
                 continue
 
             if mode == "RDF":
-                prob, _, centers = _get_distance_distribution(frames, rmax=rmax, bins=bins)
+                y, _, centers = _get_distance_distribution(frames, rmax=rmax, bins=bins)
             else:
-                prob, _, centers = _get_angle_distribution(frames, rcut=rcut, bins=bins)
+                y, _, centers = _get_angle_distribution(frames, rcut=rcut, bins=bins)
 
-            plt.plot(centers, prob, label=label, linewidth=2, alpha=0.8)
-            
+            plt.plot(centers, y, label=label, linewidth=2, alpha=0.8)
+
             if "Reference" in label or "AIMD" in label:
-                plt.fill_between(centers, prob, alpha=0.2)
-                
+                plt.fill_between(centers, y, alpha=0.2)
+
         except Exception as e:
             print(f"Error processing {label}: {e}")
 
     plt.xlabel(xlabel)
-    plt.ylabel("Probability Density")
+    plt.ylabel(ylabel)
     plt.title(f"{title} (Steps {burn_in}+)")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    
+
     if mode == "RDF":
         plt.xlim(0, rmax)
+        plt.axhline(1.0, color='k', linestyle='--', linewidth=0.8, alpha=0.5, label='g(r)=1')
     else:
         plt.xlim(0, 180)
     plt.ylim(0, None)
@@ -142,10 +143,7 @@ def _load_data_sources(cfg):
     comparisons = cfg.get("compare_csvs")
     
     if not comparisons:
-        print("\n🚨 WARNING: 'compare_csvs' was stripped by the runner! Forcing AIMD data manually...")
-        comparisons = {
-            "AIMD": "/users/PAS3201/arehartn/NNOC_MLIP_runs/AIMD_plot_csv/pbe_combined_1705.csv"
-        }
+        return sources
 
     # Safely handle if comparisons is a List or a Dictionary
     comp_items = comparisons.items() if isinstance(comparisons, dict) else [(Path(p).name, p) for p in comparisons]
