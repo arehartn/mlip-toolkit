@@ -102,9 +102,7 @@ def _calculate_msd(frames):
         sq_dist = np.sum(diff**2, axis=-1)
         msd_arr[lag] = np.mean(sq_dist)
 
-    # Exclude the trivially-zero lag=0 entry from the summary scalar so it
-    # does not bias the mean toward zero.
-    return np.mean(msd_arr[1:]), msd_arr
+    return msd_arr
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
     vels = np.array([f.get_velocities() for f in frames])
@@ -265,13 +263,44 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
         raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
 
-    # 7. Mean Squared Displacement (MSD) Error
+    # 7. Diffusion Coefficient from MSD (Einstein relation: MSD = 6*D*t)
     if cfg.get("run_msd", True):
-        ref_msd_mean, ref_msd_arr = _calculate_msd(ref_frames)
-        pred_msd_mean, pred_msd_arr = _calculate_msd(pred_frames)
-        res["MSD_Error_A2"] = abs(ref_msd_mean - pred_msd_mean)
-        
-        raw_data["Ref_MSD_vs_Time_A2"] = ref_msd_arr
+        log_int = cfg.get("log_interval", 1)
+        # Physical time between saved frames in seconds
+        dt_frame_s = dt_fs * log_int * 1e-15
+
+        ref_msd_arr  = _calculate_msd(ref_frames)
+        pred_msd_arr = _calculate_msd(pred_frames)
+
+        n_lags = len(ref_msd_arr)
+        time_s = np.arange(n_lags) * dt_frame_s  # seconds
+
+        def _diffusion_coeff(msd_arr, time_s):
+            """Fit MSD[25%:75%] vs t to extract D = slope/6 in m²/s.
+
+            The first quarter is dominated by ballistic/vibrational motion;
+            the last quarter has high statistical noise (few time-origin pairs).
+            Fitting the middle 25–75% of the trajectory is the standard
+            literature approach for extracting D from MD.
+            """
+            n = len(msd_arr)
+            lo, hi = n // 4, 3 * n // 4
+            if hi - lo < 2:
+                # Trajectory too short for a reliable fit; fall back to endpoint
+                return msd_arr[-1] / (6.0 * time_s[-1]) * 1e-20 if time_s[-1] > 0 else 0.0
+            slope = np.polyfit(time_s[lo:hi], msd_arr[lo:hi], 1)[0]  # Å²/s
+            return slope / 6.0 * 1e-20  # convert Å²/s → m²/s
+
+        D_ref  = _diffusion_coeff(ref_msd_arr,  time_s)
+        D_pred = _diffusion_coeff(pred_msd_arr, time_s)
+
+        res["D_ref_m2_s"]   = D_ref
+        res["D_pred_m2_s"]  = D_pred
+        res["D_Error_m2_s"] = abs(D_ref - D_pred)
+
+        # Keep MSD time-axis in ps for human-readable CSV
+        raw_data["MSD_Time_ps"]         = time_s * 1e12
+        raw_data["Ref_MSD_vs_Time_A2"]  = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
     # 8. Vibrational Density of States (VDOS)
