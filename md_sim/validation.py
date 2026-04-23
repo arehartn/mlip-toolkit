@@ -30,13 +30,16 @@ def _get_distance_distribution(frames, rmax=6.0, bins=100):
         h, _ = np.histogram(dists, bins=bin_edges)
         hists += h
 
-    # g(r) = n(r) / [N_frames * N_pairs * rho * 4*pi*r^2 * dr]
-    # where N_pairs = N*(N-1)/2 (unique pairs, upper-triangle convention)
-    # and rho = N/V is the number density.
+    # g(r) = hists / ideal_counts, where ideal_counts is the expected number of
+    # upper-triangle pair counts in [r, r+dr] per frame for a uniform ideal gas:
+    #
+    #   ideal = N*(N-1)/2 * 4*pi*r^2*dr / V
+    #
     # For a perfectly uniform density this gives g(r) = 1 at every r.
+    # Note: do NOT multiply by rho = N/V here — that introduces an extra N factor
+    # and suppresses all g(r) values by N (e.g. 768×), flattening the plot.
     n_pairs = n_atoms * (n_atoms - 1) / 2
-    rho = n_atoms / volume
-    ideal_counts = n_frames * n_pairs * rho * 4.0 * np.pi * r_centers**2 * dr
+    ideal_counts = n_frames * n_pairs * 4.0 * np.pi * r_centers**2 * dr / volume
     with np.errstate(invalid='ignore', divide='ignore'):
         g_r = np.where(ideal_counts > 0, hists / ideal_counts, 0.0)
 
@@ -107,8 +110,16 @@ def _calculate_msd(frames):
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
     vels = np.array([f.get_velocities() for f in frames])
     
-    # Fallback just in case velocities are missing
-    if vels[0] is None or np.all(vels[0] == 0.0):
+    # Fallback if velocities are missing or effectively zero across the trajectory.
+    # Checking only frame 0 is not enough: AIMD formats (e.g. XDATCAR, vasprun.xml)
+    # often store velocities for some frames but not others, leaving most frames as
+    # zeros and producing a white-noise VACF.  Check the mean absolute velocity
+    # across all frames instead.
+    try:
+        mean_speed = np.mean(np.abs(vels.astype(float)))
+    except (TypeError, ValueError):
+        mean_speed = 0.0
+    if vels[0] is None or mean_speed < 1e-8:
         print("    Warning: Valid velocities not found! Approximating from positions...")
         steps, atoms = len(frames), len(frames[0])
         vels = np.zeros((steps, atoms, 3))
@@ -306,21 +317,37 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     # 8. Vibrational Density of States (VDOS)
     if cfg.get("run_vdos", False):
         try:
-            log_int = cfg.get("log_interval", 1) 
-            ref_vdos_norm, ref_vdos_raw, x_vdos = _calculate_vdos_spectrum(ref_frames, dt_fs, log_interval=log_int)
-            pred_vdos_norm, pred_vdos_raw, _ = _calculate_vdos_spectrum(pred_frames, dt_fs, log_interval=log_int)
-            
-            # EMD with frequency bin positions as the 1D support.
-            # Result has units of THz.
+            # AIMD and MACE trajectories can have different timesteps and output
+            # intervals.  Use aimd_dt_fs / aimd_log_interval for the reference if
+            # provided; fall back to the MACE values if not.
+            aimd_dt_fs       = cfg.get("aimd_dt_fs",       dt_fs)
+            aimd_log_interval = cfg.get("aimd_log_interval", log_int)
+
+            ref_vdos_norm,  ref_vdos_raw,  ref_vdos_freq  = _calculate_vdos_spectrum(
+                ref_frames,  aimd_dt_fs, log_interval=aimd_log_interval)
+            pred_vdos_norm, pred_vdos_raw, pred_vdos_freq = _calculate_vdos_spectrum(
+                pred_frames, dt_fs,      log_interval=log_int)
+
+            # EMD: if spectra have different lengths (different frame counts or dt),
+            # interpolate pred onto ref's frequency grid before computing.
+            if len(ref_vdos_norm) != len(pred_vdos_norm):
+                pred_norm_interp = np.interp(ref_vdos_freq, pred_vdos_freq, pred_vdos_norm)
+                pred_norm_interp /= pred_norm_interp.sum()
+            else:
+                pred_norm_interp = pred_vdos_norm
+
             res["EMD_VDOS_THz"] = wasserstein_distance(
-                x_vdos, x_vdos, u_weights=ref_vdos_norm, v_weights=pred_vdos_norm
+                ref_vdos_freq, ref_vdos_freq,
+                u_weights=ref_vdos_norm, v_weights=pred_norm_interp
             )
-            
-            raw_data["VDOS_Freq_THz"] = x_vdos
-            raw_data["VDOS_Ref_Raw_Intensity"] = ref_vdos_raw
-            raw_data["VDOS_Pred_Raw_Intensity"] = pred_vdos_raw
-            raw_data["VDOS_Ref_Norm_Prob"] = ref_vdos_norm
-            raw_data["VDOS_Pred_Norm_Prob"] = pred_vdos_norm
+
+            # Separate freq axis per trajectory so columns always align correctly.
+            raw_data["Ref_VDOS_Freq_THz"]      = ref_vdos_freq
+            raw_data["Ref_VDOS_Raw_Intensity"]  = ref_vdos_raw
+            raw_data["Ref_VDOS_Norm_Prob"]      = ref_vdos_norm
+            raw_data["Pred_VDOS_Freq_THz"]      = pred_vdos_freq
+            raw_data["Pred_VDOS_Raw_Intensity"] = pred_vdos_raw
+            raw_data["Pred_VDOS_Norm_Prob"]     = pred_vdos_norm
         except Exception as e:
             print(f"Warning: Could not compute VDOS: {e}")
 
