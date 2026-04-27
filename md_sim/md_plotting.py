@@ -52,18 +52,9 @@ def generate_plots(cfg):
     _plot_thermo(cfg, out_dir)
     
     # 2. Structural Overlays (RDF & ADF)
-    trajs_to_plot = {}
-    
-    curr_traj = cfg.get("trajectory_file")
-    if curr_traj and Path(curr_traj).exists():
-        trajs_to_plot["MACE (Current Run)"] = curr_traj
-        
-    ref_traj = cfg.get("reference_traj_file")
-    if ref_traj and Path(ref_traj).exists():
-        trajs_to_plot["AIMD (Reference)"] = ref_traj
-
+    trajs_to_plot = _build_structural_traj_dict(cfg)
     burn_in = cfg.get("validation_burn_in_frames", 800)
-    
+
     if trajs_to_plot:
         _plot_structural_overlay(trajs_to_plot, out_dir / "rdf_overlay.png", mode="RDF", burn_in=burn_in, cfg=cfg)
         _plot_structural_overlay(trajs_to_plot, out_dir / "adf_overlay.png", mode="ADF", burn_in=burn_in, cfg=cfg)
@@ -79,6 +70,42 @@ def generate_plots(cfg):
     atoms_csv = cfg.get("atoms_csv")
     if atoms_csv and Path(atoms_csv).exists():
         _plot_velocity_histogram(atoms_csv, out_dir / "velocity_histogram.png")
+
+def _build_structural_traj_dict(cfg):
+    """Builds the {label: path} dict for RDF/ADF plots, using the same label keys as the rest of the plots."""
+    trajs = {}
+
+    curr_traj = cfg.get("trajectory_file")
+    if curr_traj and Path(curr_traj).exists():
+        label = cfg.get("current_run_label", "Current Run")
+        trajs[label] = curr_traj
+
+    ref_traj = cfg.get("reference_traj_file")
+    if ref_traj and Path(ref_traj).exists():
+        # Mirror the first compare_csvs key if available, otherwise fall back to a generic name
+        compare_csvs = cfg.get("compare_csvs", {})
+        if isinstance(compare_csvs, dict) and compare_csvs:
+            ref_label = next(iter(compare_csvs))
+        else:
+            ref_label = cfg.get("reference_traj_label", "Reference")
+        trajs[ref_label] = ref_traj
+
+    return trajs
+
+
+def plot_rdf(cfg):
+    """Standalone entry point to regenerate only the RDF overlay plot."""
+    _apply_plot_style(cfg)
+    out_dir = Path(cfg.get("output_dir", "./plots"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trajs_to_plot = _build_structural_traj_dict(cfg)
+    burn_in = cfg.get("validation_burn_in_frames", 800)
+    if trajs_to_plot:
+        _plot_structural_overlay(trajs_to_plot, out_dir / "rdf_overlay.png", mode="RDF", burn_in=burn_in, cfg=cfg)
+        print(f"RDF plot saved to {out_dir / 'rdf_overlay.png'}")
+    else:
+        print("No trajectories found; nothing to plot.")
+
 
 def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800, cfg=None):
     """Uses validation module logic to overlay RDF or ADF for multiple trajectories."""
