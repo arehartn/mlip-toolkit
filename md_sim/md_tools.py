@@ -2,99 +2,149 @@ import csv
 import numpy as np
 from ase import units
 from ase.io import read, write
+from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from mace.calculators import mace_mp
+from ase.md.velocitydistribution import (
+    MaxwellBoltzmannDistribution,
+    Stationary,
+    ZeroRotation,
+)
 
-def setup_atoms_and_calculator(structure_path, model_type="large", device="cpu"):
-    """
-    Reads the structure and attaches the MACE calculator.
-    """
+try:
+    from ase.constraints import FixCom
+except ImportError:
+    try:
+        from ase.constraints.fixcom import FixCom
+    except ImportError:
+        FixCom = None
+
+
+# Inside md_tools.py
+
+def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu"):
     atoms = read(structure_path)
-    calc = mace_mp(model=model_type, device=device)
+    
+    if model_type.lower() == "mace":
+        print(f"Initializing MACE ({model_variant}) calculator...")
+        
+        # --- THE UPGRADE: Check if using a custom fine-tuned model ---
+        if str(model_variant).endswith(".model"):
+            from mace.calculators import MACECalculator
+            calc = MACECalculator(
+                model_paths=str(model_variant), 
+                device=device, 
+                default_dtype='float64'
+            )
+        else:
+            # Fallback: Load the built-in MACE sizes (large, medium-0b, etc.)
+            from mace.calculators import mace_mp
+            calc = mace_mp(model=model_variant, device=device, default_dtype='float64')
+        
+    elif model_type.lower() == "chgnet":
+        # LAZY IMPORT
+        from chgnet.model.dynamics import CHGNetCalculator
+        from chgnet.model.model import CHGNet
+        print(f"Initializing CHGNet ({model_variant}) calculator...")
+        
+        # Load the default newest CHGNet, or a specific built-in version (like "0.2.0")
+        if model_variant in ["default", "", None]:
+            chgnet_model = CHGNet.load()
+        else:
+            chgnet_model = CHGNet.load(model_name=model_variant)
+            
+        calc = CHGNetCalculator(model=chgnet_model, use_device=device, compute_stress=False)
+        
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
     atoms.calc = calc
     return atoms
 
-def initialize_velocities(atoms, temperature_K):
-    """
-    Sets initial Maxwell-Boltzmann distribution and removes drift.
+def initialize_velocities(atoms, temperature_K, stationary=True, zero_rotation=False):
+    """Initialize velocities from a Maxwell-Boltzmann distribution.
+
+    stationary    : zero net linear momentum at t=0 (default True).
+    zero_rotation : zero net angular momentum at t=0. Recommended for
+                    isolated molecules/clusters; usually leave False
+                    for periodic crystals.
     """
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K)
-    Stationary(atoms)
+    if stationary:
+        Stationary(atoms)
+    if zero_rotation:
+        ZeroRotation(atoms)
 
 def setup_dynamics(atoms, temperature_K, dt_fs, friction):
-    """
-    Initializes the Langevin dynamics engine.
-    """
     dyn = Langevin(atoms,
                    timestep=dt_fs * units.fs,
                    temperature_K=temperature_K,
                    friction=friction)
     return dyn
 
+def apply_fix_com(atoms):
+    """Attach an ASE FixCom constraint so the center of mass stays
+    fixed throughout the dynamics (subtracts COM motion every step)."""
+    constraints = list(atoms.constraints) if atoms.constraints else []
+    if not any(isinstance(c, FixCom) for c in constraints):
+        constraints.append(FixCom())
+        atoms.set_constraint(constraints)
+    return atoms
+    
 class MDLogger:
-    """
-    Handles CSV initialization and per-step logging.
-    """
     def __init__(self, atoms, dynamics, params):
         self.atoms = atoms
         self.dyn = dynamics
         self.params = params
         self.summary_path = params["summary_csv"]
         self.atoms_path = params["atoms_csv"]
-        self.traj_path = params["trajectory_file"]
+        self.traj_path = str(params["trajectory_file"])
         
-        # Initialize files with headers
+        # NEW: Initialize ASE's native binary trajectory writer
+        self.traj_writer = Trajectory(self.traj_path, 'w', self.atoms)
+        
         self._init_csv_files()
 
     def _init_csv_files(self):
         with self.summary_path.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "time_ps", "energy_eV", "temperature_K"])
+            writer.writerow(["step", "time_ps", "energy_pot_eV", "energy_kin_eV", "energy_tot_eV", "temperature_K"])
 
         with self.atoms_path.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "step", "atom_index",
-                "x", "y", "z",
-                "vx", "vy", "vz",
-                "fx", "fy", "fz"
+                "step", "atom_index", "x", "y", "z",
+                "vx", "vy", "vz", "fx", "fy", "fz"
             ])
 
     def __call__(self):
-        """
-        This method is called by dyn.attach() at every interval.
-        """
-        # Gather data
         step = self.dyn.nsteps
         time_ps = step * self.params["dt_fs"] / 1000.0
         
         forces = self.atoms.get_forces()
         positions = self.atoms.get_positions()
         velocities = self.atoms.get_velocities()
-        energy = self.atoms.get_potential_energy()
+        
+        epot = self.atoms.get_potential_energy()
+        ekin = self.atoms.get_kinetic_energy()
+        etot = epot + ekin
         temp = self.atoms.get_temperature()
 
-        # 1. Console Output
         print(f"Step: {step:6d}  Time: {time_ps:8.3f} ps  "
-              f"Energy: {energy:12.6f} eV  Temp: {temp:8.2f} K")
+              f"E_tot: {etot:12.6f} eV  Temp: {temp:8.2f} K")
 
-        # 2. Append Summary CSV
         with self.summary_path.open("a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([step, time_ps, energy, temp])
+            writer.writerow([step, time_ps, epot, ekin, etot, temp])
 
-        # 3. Append Atoms CSV (Bulk data)
         with self.atoms_path.open("a", newline="") as f:
             writer = csv.writer(f)
-            # Create a generator or list for bulk writing
             rows = []
             for i, ((x, y, z), (vx, vy, vz), (fx, fy, fz)) in enumerate(zip(positions, velocities, forces)):
                 rows.append([step, i, x, y, z, vx, vy, vz, fx, fy, fz])
             writer.writerows(rows)
 
-        # 4. Write Trajectory (ExtXYZ)
-        # Store velocities so they are written to the xyz file
+        # Attach velocities so they get saved in the traj
         self.atoms.set_array('velocities', velocities)
-        comment = f"Time={time_ps:.3f}ps Energy={energy:.6f}eV Temp={temp:.2f}K"
-        write(self.traj_path, self.atoms, format='extxyz', append=True, comment=comment)
+        
+        # NEW: Write to binary .traj cleanly (Replaces the clunky write append)
+        self.traj_writer.write()
