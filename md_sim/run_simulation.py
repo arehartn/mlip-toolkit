@@ -61,6 +61,7 @@ def run(config=None, config_path=None, config_overrides=None):
         model_type=cfg["model_type"],
         model_variant=cfg.get("model_variant", "large"),
         device=cfg["device"],
+        head=cfg.get("head", None),
     )
 
     md_tools.initialize_velocities(
