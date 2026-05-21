@@ -33,8 +33,8 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
             calc = MACECalculator(
                 model_paths=str(model_variant), 
                 device=device, 
-                default_dtype='float64'
-                head=head,
+                default_dtype='float64',
+                head=head
             )
         else:
             # Fallback: Load the built-in MACE sizes (large, medium-0b, etc.)
