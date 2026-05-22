@@ -21,7 +21,7 @@ except ImportError:
 
 # Inside md_tools.py
 
-def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu"):
+def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu", head=None):
     atoms = read(structure_path)
     
     if model_type.lower() == "mace":
@@ -33,7 +33,8 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
             calc = MACECalculator(
                 model_paths=str(model_variant), 
                 device=device, 
-                default_dtype='float64'
+                default_dtype='float64',
+                head=head
             )
         else:
             # Fallback: Load the built-in MACE sizes (large, medium-0b, etc.)

@@ -1,0 +1,57 @@
+{
+  "input_structure": "POSCAR",
+  "temp_kelvin": 800,
+  "model_type": "mace",
+  "model_variant": "large",
+  "device": "cpu",
+  "seed": 42,
+
+  "dt_fs": 0.5,
+  "friction": 0.02,
+  "n_steps": 10000,
+  "log_interval": 1,
+
+  "summary_csv": "md_summary.csv",
+  "atoms_csv": "md_atoms.csv",
+  "trajectory_file": "large_traj.traj",
+
+  "stationary": true,
+  "zero_rotation": false,
+  "fix_com": true,
+
+  "make_plots": false,
+  "plot_thermo": true,
+  "plot_structural_overlays": true,
+  "plot_parity": true,
+  "plot_velocity_histogram": true,
+  "output_dir": "plots",
+  "compare_csvs": {},
+  "current_run_label": "Current Run",
+  "reference_traj_label": "Reference",
+
+  "run_validation": false,
+  "reference_traj_file": null,
+  "validation_output_csv": "validation_results.csv",
+  "validation_burn_in_frames": 0,
+  "equilibration_frame": 0,
+
+  "run_energy": true,
+  "run_forces": true,
+  "run_rdf": true,
+  "run_adf": true,
+  "run_cv": true,
+  "run_msd": true,
+  "run_vdos": false,
+  "aimd_dt_fs": null,
+  "aimd_log_interval": null,
+
+  "plot_style": {
+    "font_size": 12,
+    "title_size": 14,
+    "label_size": 12,
+    "legend_size": 12,
+    "line_width": 1.5,
+    "scatter_size_energy": 20,
+    "scatter_size_forces": 1
+  }
+}

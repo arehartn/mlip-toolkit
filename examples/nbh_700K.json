@@ -1,0 +1,50 @@
+{
+  "input_structure": "/users/PAS3201/arehartn/NBH_MLIP_data/mixed_phase/POSCAR",
+  "model_type": "mace",
+  "model_variant": "medium-0b2",
+  "device": "cuda",
+  "seed": 1212,
+
+  "temp_kelvin": 700,
+  "dt_fs": 0.5,
+  "friction": 0.01,
+  "n_steps": 2000,
+  "log_interval": 1,
+
+  "stationary": true,
+  "fix_com": true,
+  "zero_rotation": false,
+
+  "summary_csv": "mace_medium-0b2_summary.csv",
+  "atoms_csv": "mace_medium-0b2_detailed.csv",
+  "trajectory_file": "mace_medium-0b2_traj.traj",
+
+  "current_run_label": "MACE Medium-0b2",
+  "compare_csvs": {},
+
+  "make_plots": false,
+  "plot_thermo": true,
+  "plot_structural_overlays": true,
+  "plot_parity": true,
+  "plot_velocity_histogram": true,
+  "output_dir": "./plots",
+
+  "custom_x_cols": ["step"],
+  "custom_tot_cols": ["E_tot_eV", "energy_tot_eV"],
+  "custom_temp_cols": ["temperature_K", "temp_inst_K"],
+  "custom_kin_cols": ["E_kin_eV", "energy_kin_eV"],
+  "custom_pot_cols": ["E_pot_eV", "energy_pot_eV"],
+
+  "run_validation": false,
+  "reference_traj_file": "/users/PAS3201/arehartn/NBH_MLIP_data/mixed_phase/700K_0p5fs_1000_steps/mixed_700K.traj",
+  "validation_output_csv": "mace_medium-0b2_validation.csv",
+  "validation_burn_in_frames": 800,
+
+  "run_energy": false,
+  "run_forces": false,
+  "run_rdf": false,
+  "run_adf": false,
+  "run_cv": false,
+  "run_msd": false,
+  "run_vdos": false
+}

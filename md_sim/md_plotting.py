@@ -48,28 +48,29 @@ def generate_plots(cfg):
     out_dir = Path(cfg.get("output_dir", "./plots"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Thermodynamics Plots (Temp, Kin/Pot, Tot) with comparisons
-    _plot_thermo(cfg, out_dir)
-    
-    # 2. Structural Overlays (RDF & ADF)
+    if cfg.get("plot_thermo", True):
+        _plot_thermo(cfg, out_dir)
+
     trajs_to_plot = _build_structural_traj_dict(cfg)
     burn_in = cfg.get("validation_burn_in_frames", 800)
+    ref_traj = cfg.get("reference_traj_file")
+    curr_traj = cfg.get("trajectory_file")
 
-    if trajs_to_plot:
+    if cfg.get("plot_structural_overlays", True) and trajs_to_plot:
         _plot_structural_overlay(trajs_to_plot, out_dir / "rdf_overlay.png", mode="RDF", burn_in=burn_in, cfg=cfg)
         _plot_structural_overlay(trajs_to_plot, out_dir / "adf_overlay.png", mode="ADF", burn_in=burn_in, cfg=cfg)
 
-    # 3. Parity Plots (Energy/Force Accuracy)
-    if ref_traj and Path(ref_traj).exists() and curr_traj and Path(curr_traj).exists():
-        plot_parity(ref_traj, curr_traj, str(out_dir / "accuracy_parity"), cfg=cfg)
-    elif ref_traj:
-        print(f"Skipping parity plots. Ensure both trajectories exist.\n"
-              f"  Ref:  {ref_traj}\n  Pred: {curr_traj}")
-              
-    # 2.5 Velocity Histograms (v_x, v_y, v_z at last step)
-    atoms_csv = cfg.get("atoms_csv")
-    if atoms_csv and Path(atoms_csv).exists():
-        _plot_velocity_histogram(atoms_csv, out_dir / "velocity_histogram.png")
+    if cfg.get("plot_parity", True):
+        if ref_traj and Path(ref_traj).exists() and curr_traj and Path(curr_traj).exists():
+            plot_parity(ref_traj, curr_traj, str(out_dir / "accuracy_parity"), cfg=cfg)
+        elif ref_traj:
+            print(f"Skipping parity plots. Ensure both trajectories exist.\n"
+                  f"  Ref:  {ref_traj}\n  Pred: {curr_traj}")
+
+    if cfg.get("plot_velocity_histogram", True):
+        atoms_csv = cfg.get("atoms_csv")
+        if atoms_csv and Path(atoms_csv).exists():
+            _plot_velocity_histogram(atoms_csv, out_dir / "velocity_histogram.png")
 
 def _build_structural_traj_dict(cfg):
     """Builds the {label: path} dict for RDF/ADF plots, using the same label keys as the rest of the plots."""

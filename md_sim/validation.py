@@ -365,11 +365,18 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
     return res
 
-def run(config_overrides=None):
-    from md_sim.md_config import PARAMS
-    cfg = PARAMS.copy()
+def run(config=None, config_path=None, config_overrides=None):
+    from md_sim.config import load_config, normalize_config
+
+    if config is None:
+        cfg = load_config(config_path, profile="simulation")
+    else:
+        cfg = dict(config)
+        if config_path is not None:
+            cfg = {**load_config(config_path, profile="simulation"), **cfg}
     if config_overrides:
         cfg.update(config_overrides)
+    cfg = normalize_config(cfg)
 
     ref_traj = cfg.get("reference_traj_file")
     pred_traj = cfg.get("trajectory_file")
@@ -387,5 +394,15 @@ def run(config_overrides=None):
     
     return results
 
+def main():
+    import argparse
+    from md_sim.config import add_config_cli
+
+    parser = argparse.ArgumentParser(description="Validate MD trajectories against a reference.")
+    add_config_cli(parser)
+    args = parser.parse_args()
+    run(config_path=args.config)
+
+
 if __name__ == "__main__":
-    run()
+    main()
