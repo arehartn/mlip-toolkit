@@ -162,13 +162,24 @@ def _calculate_vacf(frames, dt_fs, log_interval=1):
     return vacf, lag_ps
 
 
+def _aimd_dt_params(cfg, dt_fs, log_int):
+    """AIMD frame spacing; None / missing keys fall back to MLIP dt_fs and log_interval."""
+    aimd_dt = cfg.get("aimd_dt_fs")
+    aimd_log = cfg.get("aimd_log_interval")
+    return (
+        dt_fs if aimd_dt is None else aimd_dt,
+        log_int if aimd_log is None else aimd_log,
+    )
+
+
 def traj_dt_params(traj_path, cfg):
     """Return (dt_fs, log_interval) for a trajectory path (AIMD vs MLIP)."""
     log_int = cfg.get("log_interval", 1)
+    dt_fs = cfg.get("dt_fs", 1.0)
     ref = cfg.get("reference_traj_file")
     if ref and Path(traj_path).resolve() == Path(ref).resolve():
-        return cfg.get("aimd_dt_fs", cfg.get("dt_fs", 1.0)), cfg.get("aimd_log_interval", log_int)
-    return cfg.get("dt_fs", 1.0), log_int
+        return _aimd_dt_params(cfg, dt_fs, log_int)
+    return dt_fs, log_int
 
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
@@ -352,8 +363,7 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     # 8. Velocity Autocorrelation Function (VACF)
     if cfg.get("run_vacf", False):
         try:
-            aimd_dt_fs = cfg.get("aimd_dt_fs", dt_fs)
-            aimd_log_interval = cfg.get("aimd_log_interval", log_int)
+            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
 
             ref_vacf, ref_vacf_lag = _calculate_vacf(
                 ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
@@ -384,8 +394,7 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             # AIMD and MACE trajectories can have different timesteps and output
             # intervals.  Use aimd_dt_fs / aimd_log_interval for the reference if
             # provided; fall back to the MACE values if not.
-            aimd_dt_fs       = cfg.get("aimd_dt_fs",       dt_fs)
-            aimd_log_interval = cfg.get("aimd_log_interval", log_int)
+            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
 
             ref_vdos, ref_vdos_pmf, ref_vdos_freq = _calculate_vdos_spectrum(
                 ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
