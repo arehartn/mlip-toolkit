@@ -107,9 +107,10 @@ def _calculate_msd(frames):
 
     return msd_arr
 
-def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
+def _get_velocities(frames, dt_fs, log_interval=1):
+    """Return per-frame velocities (Å/fs), approximating from positions if needed."""
     vels = np.array([f.get_velocities() for f in frames])
-    
+
     # Fallback if velocities are missing or effectively zero across the trajectory.
     # Checking only frame 0 is not enough: AIMD formats (e.g. XDATCAR, vasprun.xml)
     # often store velocities for some frames but not others, leaving most frames as
@@ -125,7 +126,7 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
         vels = np.zeros((steps, atoms, 3))
         cell, pbc = frames[0].get_cell(), frames[0].get_pbc()
         frame_dt = dt_fs * log_interval
-        
+
         for i in range(steps):
             if i == 0:
                 delta_r = frames[1].get_positions() - frames[0].get_positions()
@@ -134,43 +135,76 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
                 delta_r = frames[-1].get_positions() - frames[-2].get_positions()
                 dt_step = frame_dt
             else:
-                delta_r = frames[i+1].get_positions() - frames[i-1].get_positions()
+                delta_r = frames[i + 1].get_positions() - frames[i - 1].get_positions()
                 dt_step = 2 * frame_dt
             delta_r_mic, _ = find_mic(delta_r, cell, pbc)
             vels[i] = delta_r_mic / dt_step
 
+    return vels
+
+
+def _calculate_vacf(frames, dt_fs, log_interval=1):
+    """Velocity autocorrelation function C_v(t), normalized to C_v(0) = 1."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
     steps, atoms, dims = vels.shape
     vacf = np.zeros(steps)
     for i in range(atoms):
         for j in range(dims):
             v = vels[:, i, j]
             corr = correlate(v, v, mode='full')
-            vacf += corr[steps-1:] / np.arange(steps, 0, -1)
-            
-    # Normalize VACF so it starts at 1.0
+            vacf += corr[steps - 1:] / np.arange(steps, 0, -1)
+
     if vacf[0] == 0.0:
         raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
     vacf = vacf / vacf[0]
 
+    lag_ps = np.arange(steps) * dt_fs * log_interval * 1e-3
+    return vacf, lag_ps
+
+
+def traj_dt_params(traj_path, cfg):
+    """Return (dt_fs, log_interval) for a trajectory path (AIMD vs MLIP)."""
+    log_int = cfg.get("log_interval", 1)
+    ref = cfg.get("reference_traj_file")
+    if ref and Path(traj_path).resolve() == Path(ref).resolve():
+        return cfg.get("aimd_dt_fs", cfg.get("dt_fs", 1.0)), cfg.get("aimd_log_interval", log_int)
+    return cfg.get("dt_fs", 1.0), log_int
+
+
+def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
+    """Vibrational DOS from MD: power spectrum of the normalized VACF.
+
+    Literature convention (e.g. VASP MD phonon spectra, vacf tools):
+      C(t) = <Σ_i v_i(0)·v_i(t)> / <Σ_i v_i(0)·v_i(0)>   with C(0) = 1
+      g(ω) = |∫ C(t) e^{-iωt} dt|²
+
+    Returns
+    -------
+    vdos : ndarray
+        One-sided phonon spectral function g(ω) (arbitrary units, ∝ |FFT|²·Δt).
+    vdos_pmf : ndarray
+        g(ω) / Σ g(ω) — discrete shape only; used for EMD, not for publication plots.
+    freqs_THz : ndarray
+    """
+    vacf, _ = _calculate_vacf(frames, dt_fs, log_interval)
+    steps = len(vacf)
+    dt_s = dt_fs * log_interval * 1e-15
+
     # Half-Hann window: take the right half of an odd-length full window.
     # hann(2N-1)[N-1:] starts at exactly 1.0 (the peak) and ends at exactly
     # 0.0, giving a smooth taper with no amplitude distortion at lag=0.
-    # Using hann(2N)[N:] is a common mistake — its first sample is ≈0.9998,
-    # not 1.0, and gets worse for short trajectories.
     window = hann(2 * steps - 1)[steps - 1:]
     vacf_windowed = vacf * window
 
-    # The VACF is real and symmetric so by the Wiener–Khinchin theorem its
-    # Fourier transform is real and non-negative.  Use np.real + clip(0)
-    # rather than np.abs, which would inflate tiny negative numerical artefacts
-    # at high frequencies into spurious positive spectral density.
-    vdos = np.fft.rfft(vacf_windowed).real.clip(0)
-    
-    freqs_Hz = np.fft.rfftfreq(steps, d=dt_fs * log_interval * 1e-15)
-    freqs_THz = freqs_Hz * 1e-12 
-    
-    norm_vdos = vdos / np.sum(vdos) if np.sum(vdos) > 0 else vdos
-    return norm_vdos, vdos, freqs_THz
+    # Power spectrum of normalized VACF (VASP / standard MD phonon DOS).
+    ft = np.fft.rfft(vacf_windowed)
+    vdos = (np.abs(ft) ** 2) * dt_s
+
+    freqs_Hz = np.fft.rfftfreq(steps, d=dt_s)
+    freqs_THz = freqs_Hz * 1e-12
+
+    vdos_pmf = vdos / np.sum(vdos) if np.sum(vdos) > 0 else vdos
+    return vdos, vdos_pmf, freqs_THz
     
 # --- 3. Main Validation Engine ---
 def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=None):
@@ -274,9 +308,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
         raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
 
+    log_int = cfg.get("log_interval", 1)
+
     # 7. Diffusion Coefficient from MSD (Einstein relation: MSD = 6*D*t)
     if cfg.get("run_msd", True):
-        log_int = cfg.get("log_interval", 1)
         # Physical time between saved frames in seconds
         dt_frame_s = dt_fs * log_int * 1e-15
 
@@ -314,7 +349,36 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_MSD_vs_Time_A2"]  = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
-    # 8. Vibrational Density of States (VDOS)
+    # 8. Velocity Autocorrelation Function (VACF)
+    if cfg.get("run_vacf", False):
+        try:
+            aimd_dt_fs = cfg.get("aimd_dt_fs", dt_fs)
+            aimd_log_interval = cfg.get("aimd_log_interval", log_int)
+
+            ref_vacf, ref_vacf_lag = _calculate_vacf(
+                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+            pred_vacf, pred_vacf_lag = _calculate_vacf(
+                pred_frames, dt_fs, log_interval=log_int)
+
+            if len(ref_vacf) != len(pred_vacf):
+                pred_vacf_interp = np.interp(ref_vacf_lag, pred_vacf_lag, pred_vacf)
+            else:
+                pred_vacf_interp = pred_vacf
+
+            ref_w = ref_vacf / ref_vacf.sum() if ref_vacf.sum() > 0 else ref_vacf
+            pred_w = pred_vacf_interp / pred_vacf_interp.sum() if pred_vacf_interp.sum() > 0 else pred_vacf_interp
+            res["EMD_VACF_ps"] = wasserstein_distance(
+                ref_vacf_lag, ref_vacf_lag, u_weights=ref_w, v_weights=pred_w
+            )
+
+            raw_data["Ref_VACF_Lag_ps"] = ref_vacf_lag
+            raw_data["Ref_VACF"] = ref_vacf
+            raw_data["Pred_VACF_Lag_ps"] = pred_vacf_lag
+            raw_data["Pred_VACF"] = pred_vacf
+        except Exception as e:
+            print(f"Warning: Could not compute VACF: {e}")
+
+    # 9. Vibrational Density of States (VDOS)
     if cfg.get("run_vdos", False):
         try:
             # AIMD and MACE trajectories can have different timesteps and output
@@ -323,31 +387,29 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             aimd_dt_fs       = cfg.get("aimd_dt_fs",       dt_fs)
             aimd_log_interval = cfg.get("aimd_log_interval", log_int)
 
-            ref_vdos_norm,  ref_vdos_raw,  ref_vdos_freq  = _calculate_vdos_spectrum(
-                ref_frames,  aimd_dt_fs, log_interval=aimd_log_interval)
-            pred_vdos_norm, pred_vdos_raw, pred_vdos_freq = _calculate_vdos_spectrum(
-                pred_frames, dt_fs,      log_interval=log_int)
+            ref_vdos, ref_vdos_pmf, ref_vdos_freq = _calculate_vdos_spectrum(
+                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+            pred_vdos, pred_vdos_pmf, pred_vdos_freq = _calculate_vdos_spectrum(
+                pred_frames, dt_fs, log_interval=log_int)
 
-            # EMD: if spectra have different lengths (different frame counts or dt),
-            # interpolate pred onto ref's frequency grid before computing.
-            if len(ref_vdos_norm) != len(pred_vdos_norm):
-                pred_norm_interp = np.interp(ref_vdos_freq, pred_vdos_freq, pred_vdos_norm)
-                pred_norm_interp /= pred_norm_interp.sum()
+            # EMD on spectral shape (PMF), not on raw g(ω) amplitudes.
+            if len(ref_vdos_pmf) != len(pred_vdos_pmf):
+                pred_pmf_interp = np.interp(ref_vdos_freq, pred_vdos_freq, pred_vdos_pmf)
+                pred_pmf_interp /= pred_pmf_interp.sum()
             else:
-                pred_norm_interp = pred_vdos_norm
+                pred_pmf_interp = pred_vdos_pmf
 
             res["EMD_VDOS_THz"] = wasserstein_distance(
                 ref_vdos_freq, ref_vdos_freq,
-                u_weights=ref_vdos_norm, v_weights=pred_norm_interp
+                u_weights=ref_vdos_pmf, v_weights=pred_pmf_interp
             )
 
-            # Separate freq axis per trajectory so columns always align correctly.
-            raw_data["Ref_VDOS_Freq_THz"]      = ref_vdos_freq
-            raw_data["Ref_VDOS_Raw_Intensity"]  = ref_vdos_raw
-            raw_data["Ref_VDOS_Norm_Prob"]      = ref_vdos_norm
-            raw_data["Pred_VDOS_Freq_THz"]      = pred_vdos_freq
-            raw_data["Pred_VDOS_Raw_Intensity"] = pred_vdos_raw
-            raw_data["Pred_VDOS_Norm_Prob"]     = pred_vdos_norm
+            raw_data["Ref_VDOS_Freq_THz"] = ref_vdos_freq
+            raw_data["Ref_VDOS_g_omega"] = ref_vdos
+            raw_data["Ref_VDOS_Shape_PMF"] = ref_vdos_pmf
+            raw_data["Pred_VDOS_Freq_THz"] = pred_vdos_freq
+            raw_data["Pred_VDOS_g_omega"] = pred_vdos
+            raw_data["Pred_VDOS_Shape_PMF"] = pred_vdos_pmf
         except Exception as e:
             print(f"Warning: Could not compute VDOS: {e}")
 

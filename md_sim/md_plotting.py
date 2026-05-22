@@ -8,10 +8,22 @@ from ase.io import read
 
 # --- Import validation logic to prevent duplicate math ---
 try:
-    from md_sim.validation import _get_distance_distribution, _get_angle_distribution
+    from md_sim.validation import (
+        _get_distance_distribution,
+        _get_angle_distribution,
+        _calculate_vacf,
+        _calculate_vdos_spectrum,
+        traj_dt_params,
+    )
 except ImportError:
     # Fallback in case the script is run directly in the same folder
-    from validation import _get_distance_distribution, _get_angle_distribution
+    from validation import (
+        _get_distance_distribution,
+        _get_angle_distribution,
+        _calculate_vacf,
+        _calculate_vdos_spectrum,
+        traj_dt_params,
+    )
 
 try:
     from sklearn.metrics import mean_absolute_error
@@ -71,6 +83,18 @@ def generate_plots(cfg):
         atoms_csv = cfg.get("atoms_csv")
         if atoms_csv and Path(atoms_csv).exists():
             _plot_velocity_histogram(atoms_csv, out_dir / "velocity_histogram.png")
+
+    if trajs_to_plot:
+        if cfg.get("plot_vacf_overlay", True):
+            _plot_dynamical_overlay(
+                trajs_to_plot, out_dir / "vacf_overlay.png",
+                mode="VACF", burn_in=burn_in, cfg=cfg,
+            )
+        if cfg.get("plot_vdos_overlay", True):
+            _plot_dynamical_overlay(
+                trajs_to_plot, out_dir / "vdos_overlay.png",
+                mode="VDOS", burn_in=burn_in, cfg=cfg,
+            )
 
 def _build_structural_traj_dict(cfg):
     """Builds the {label: path} dict for RDF/ADF plots, using the same label keys as the rest of the plots."""
@@ -167,6 +191,77 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800, cfg=
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
+
+
+def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=None):
+    """Overlay VACF or VDOS for multiple trajectories (e.g. AIMD vs MLIP)."""
+    if cfg is None:
+        cfg = {}
+    plt.figure(figsize=(8, 5))
+    lw = cfg.get("plot_style", {}).get("line_width", 2)
+    # Literature default: g(ω) = |∫ C(t)e^{-iωt}dt|². Optional "peak" scales curves for overlay.
+    vdos_scale = cfg.get("plot_vdos_scale", "spectrum")
+    if cfg.get("plot_vdos_normalized", False):
+        vdos_scale = "area"  # legacy: sum-to-1 PMF (not literature g(ω))
+
+    if mode == "VACF":
+        xlabel, ylabel, title = "Lag time (ps)", r"$C_v(t)$", "Velocity Autocorrelation Function"
+    else:
+        xlabel = "Frequency (THz)"
+        title = r"Phonon spectral function $g(\omega)=|\int C(t)e^{-i\omega t}\,dt|^2$"
+        if vdos_scale == "area":
+            ylabel = r"$g(\omega)$ (shape PMF, $\sum g\,\Delta\omega=1$)"
+        elif vdos_scale == "peak":
+            ylabel = r"$g(\omega) / \max g(\omega)$"
+        else:
+            ylabel = r"$g(\omega)$ (a.u.)"
+
+    for label, path in traj_dict.items():
+        print(f"Calculating {mode} plot for {label}...")
+        try:
+            full_traj = read(str(path), index=":")
+            if not full_traj:
+                continue
+
+            actual_burn = burn_in if burn_in < len(full_traj) else max(0, len(full_traj) // 2)
+            frames = full_traj[actual_burn:]
+            if len(frames) < 3:
+                print(f"  Skipping {label}: need at least 3 frames after burn-in.")
+                continue
+
+            dt_fs, log_int = traj_dt_params(path, cfg)
+
+            if mode == "VACF":
+                y, x = _calculate_vacf(frames, dt_fs, log_interval=log_int)
+            else:
+                g_omega, g_pmf, x = _calculate_vdos_spectrum(frames, dt_fs, log_interval=log_int)
+                if vdos_scale == "area":
+                    y = g_pmf
+                elif vdos_scale == "peak":
+                    y = g_omega / g_omega.max() if g_omega.max() > 0 else g_omega
+                else:
+                    y = g_omega
+
+            plt.plot(x, y, label=label, linewidth=lw, alpha=0.85)
+
+            if "Reference" in label or "AIMD" in label:
+                plt.fill_between(x, y, alpha=0.15)
+
+        except Exception as e:
+            print(f"Error processing {label}: {e}")
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(f"{title} (frames {burn_in}+)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim(left=0)
+    plt.ylim(bottom=0)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Saved: {save_path}")
+
 
 def _load_data_sources(cfg):
     sources = []
