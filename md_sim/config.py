@@ -32,6 +32,7 @@ BOOLEAN_KEYS = frozenset({
     "run_vdos",
     "write_trajectory",
     "write_log",
+    "relax_cell",
     "plot_velocity_histogram",
     "plot_structural_overlays",
     "plot_vacf_overlay",

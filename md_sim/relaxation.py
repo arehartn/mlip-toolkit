@@ -1,22 +1,27 @@
 import argparse
 import os
+import numpy as np
 from ase.io import write
 from ase.filters import FrechetCellFilter
+from ase.optimize.lbfgs import LBFGS
 from ase.optimize.precon import PreconLBFGS
 from md_sim import md_tools
 from md_sim.config import add_config_cli, load_config, normalize_config
 
 
 def _resolve_config(config=None, config_path=None, config_overrides=None):
-    if config is None:
-        cfg = load_config(config_path, profile="relaxation")
-    else:
-        cfg = dict(config)
-        if config_path is not None:
-            cfg = {**load_config(config_path, profile="relaxation"), **cfg}
+    cfg = load_config(profile="relaxation")
+    if config_path is not None:
+        cfg = {**cfg, **load_config(config_path)}
+    if config is not None:
+        cfg = {**cfg, **config}
     if config_overrides:
         cfg.update(config_overrides)
-    return normalize_config(cfg)
+    cfg = normalize_config(cfg)
+    cfg["fmax"] = float(cfg["fmax"])
+    if cfg.get("max_steps") is not None:
+        cfg["max_steps"] = int(cfg["max_steps"])
+    return cfg
 
 
 def run(config=None, config_path=None, config_overrides=None):
@@ -37,9 +42,15 @@ def run(config=None, config_path=None, config_overrides=None):
         model_type=cfg["model_type"],
         model_variant=cfg["model_variant"],
         device=cfg["device"],
+        head=cfg.get("head"),
     )
 
-    ucf = FrechetCellFilter(atoms)
+    relax_cell = cfg.get("relax_cell", False)
+    fmax = cfg["fmax"]
+    max_steps = cfg.get("max_steps", 500)
+    optimizer = cfg.get("optimizer", "lbfgs").lower()
+
+    opt_target = FrechetCellFilter(atoms) if relax_cell else atoms
 
     opt_kwargs = {}
     if cfg.get("write_trajectory", True):
@@ -47,8 +58,17 @@ def run(config=None, config_path=None, config_overrides=None):
     if cfg.get("write_log", True):
         opt_kwargs["logfile"] = f"{out_prefix}.log"
 
-    opt = PreconLBFGS(ucf, **opt_kwargs)
-    opt.run(fmax=cfg["fmax"])
+    if optimizer == "precon_lbfgs":
+        opt = PreconLBFGS(opt_target, **opt_kwargs)
+    else:
+        opt = LBFGS(opt_target, **opt_kwargs)
+
+    print(f"Optimizer: {optimizer} | fmax: {fmax} eV/Å | max_steps: {max_steps}"
+          f" | relax_cell: {relax_cell}")
+    opt.run(fmax=fmax, steps=max_steps)
+
+    atomic_fmax = float(np.abs(atoms.get_forces()).max())
+    print(f"Final max atomic force: {atomic_fmax:.4f} eV/Å")
 
     e_per_atom = atoms.get_potential_energy() / len(atoms)
     out_file = f"{out_prefix}_relaxed.vasp"
