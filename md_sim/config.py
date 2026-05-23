@@ -27,6 +27,7 @@ BOOLEAN_KEYS = frozenset({
     "run_adf",
     "run_cv",
     "run_msd",
+    "run_green_kubo",
     "run_vacf",
     "run_vdos",
     "write_trajectory",
@@ -35,7 +36,6 @@ BOOLEAN_KEYS = frozenset({
     "plot_structural_overlays",
     "plot_vacf_overlay",
     "plot_vdos_overlay",
-    "plot_vdos_normalized",
     "plot_parity",
     "plot_thermo",
 })

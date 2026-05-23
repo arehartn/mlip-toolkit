@@ -199,22 +199,13 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
         cfg = {}
     plt.figure(figsize=(8, 5))
     lw = cfg.get("plot_style", {}).get("line_width", 2)
-    # Literature default: g(ω) = |∫ C(t)e^{-iωt}dt|². Optional "peak" scales curves for overlay.
-    vdos_scale = cfg.get("plot_vdos_scale", "spectrum")
-    if cfg.get("plot_vdos_normalized", False):
-        vdos_scale = "area"  # legacy: sum-to-1 PMF (not literature g(ω))
 
     if mode == "VACF":
-        xlabel, ylabel, title = "Lag time (ps)", r"$C_v(t)$", "Velocity Autocorrelation Function"
+        xlabel, ylabel, title = "Time (fs)", "VACF", "Velocity Autocorrelation Function"
+        vacf_max_fs = cfg.get("plot_vacf_max_fs")
     else:
-        xlabel = "Frequency (THz)"
-        title = r"Phonon spectral function $g(\omega)=|\int C(t)e^{-i\omega t}\,dt|^2$"
-        if vdos_scale == "area":
-            ylabel = r"$g(\omega)$ (shape PMF, $\sum g\,\Delta\omega=1$)"
-        elif vdos_scale == "peak":
-            ylabel = r"$g(\omega) / \max g(\omega)$"
-        else:
-            ylabel = r"$g(\omega)$ (a.u.)"
+        xlabel, ylabel, title = "Frequency (THz)", "Normalized Density of States", "VDOS"
+        vdos_xmax = cfg.get("plot_vdos_xmax", 100)
 
     for label, path in traj_dict.items():
         print(f"Calculating {mode} plot for {label}...")
@@ -233,14 +224,11 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
 
             if mode == "VACF":
                 y, x = _calculate_vacf(frames, dt_fs, log_interval=log_int)
+                if vacf_max_fs is not None:
+                    n = int(vacf_max_fs / (dt_fs * log_int))
+                    x, y = x[:n], y[:n]
             else:
-                g_omega, g_pmf, x = _calculate_vdos_spectrum(frames, dt_fs, log_interval=log_int)
-                if vdos_scale == "area":
-                    y = g_pmf
-                elif vdos_scale == "peak":
-                    y = g_omega / g_omega.max() if g_omega.max() > 0 else g_omega
-                else:
-                    y = g_omega
+                _, y, x = _calculate_vdos_spectrum(frames, dt_fs, log_interval=log_int)
 
             plt.plot(x, y, label=label, linewidth=lw, alpha=0.85)
 
@@ -255,8 +243,11 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
     plt.title(f"{title} (frames {burn_in}+)")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.xlim(left=0)
-    plt.ylim(bottom=0)
+    if mode == "VACF":
+        plt.axhline(0, color='k', linewidth=1, linestyle=':', alpha=0.5)
+    else:
+        plt.xlim(0, vdos_xmax)
+    plt.ylim(bottom=0 if mode == "VDOS" else None)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()

@@ -81,24 +81,23 @@ def _get_angle_distribution(frames, rcut=3.0, bins=90):
     return norm_hists, hists, angle_centers
 
 # --- 2. Dynamical Utilities ---
-def _calculate_msd(frames):
-    """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
+def _unwrap_positions(frames):
+    """Unwrap Cartesian positions for triclinic cells (same logic as MSD)."""
     positions = np.array([f.get_positions() for f in frames])
-    cell_matrix = frames[0].get_cell().array  # 3×3, rows are lattice vectors
-
-    # Unwrap in fractional (scaled) coordinates so triclinic cells are handled
-    # correctly.  Cartesian unwrapping with cell.lengths() only works for
-    # orthogonal boxes; for any non-orthogonal cell it produces wrong jumps.
+    cell_matrix = frames[0].get_cell().array
     inv_cell = np.linalg.inv(cell_matrix)
-    scaled = positions @ inv_cell.T  # (n_frames, n_atoms, 3)
+    scaled = positions @ inv_cell.T
     for i in range(1, len(scaled)):
         delta_frac = scaled[i] - scaled[i - 1]
         scaled[i] -= np.round(delta_frac)
-    positions = scaled @ cell_matrix.T  # back to Cartesian
+    return scaled @ cell_matrix.T
+
+
+def _calculate_msd(frames):
+    """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
+    positions = _unwrap_positions(frames)
 
     n_frames, n_atoms, _ = positions.shape
-    # lag=0 is trivially 0 by definition; allocate length n_frames but only
-    # fill lags 1..n_frames-1 (lag 0 stays 0 as a placeholder for the curve).
     msd_arr = np.zeros(n_frames)
     for lag in range(1, n_frames):
         diff = positions[lag:] - positions[:-lag]
@@ -107,45 +106,37 @@ def _calculate_msd(frames):
 
     return msd_arr
 
+
 def _get_velocities(frames, dt_fs, log_interval=1):
-    """Return per-frame velocities (Å/fs), approximating from positions if needed."""
-    vels = np.array([f.get_velocities() for f in frames])
+    """Velocities (Å/fs) from trajectory; position fallback only if arrays are missing."""
+    steps = len(frames)
+    if steps < 2:
+        raise ValueError("Need at least 2 frames to estimate velocities.")
 
-    # Fallback if velocities are missing or effectively zero across the trajectory.
-    # Checking only frame 0 is not enough: AIMD formats (e.g. XDATCAR, vasprun.xml)
-    # often store velocities for some frames but not others, leaving most frames as
-    # zeros and producing a white-noise VACF.  Check the mean absolute velocity
-    # across all frames instead.
     try:
-        mean_speed = np.mean(np.abs(vels.astype(float)))
+        vels = np.array([f.get_velocities() for f in frames], dtype=float)
+        usable = not np.any(np.isnan(vels)) and np.mean(np.linalg.norm(vels, axis=2)) > 1e-8
     except (TypeError, ValueError):
-        mean_speed = 0.0
-    if vels[0] is None or mean_speed < 1e-8:
-        print("    Warning: Valid velocities not found! Approximating from positions...")
-        steps, atoms = len(frames), len(frames[0])
-        vels = np.zeros((steps, atoms, 3))
-        cell, pbc = frames[0].get_cell(), frames[0].get_pbc()
-        frame_dt = dt_fs * log_interval
+        usable = False
 
+    if not usable:
+        print("    Warning: Velocities missing or unreliable — computing from unwrapped positions...")
+        pos = _unwrap_positions(frames)
+        frame_dt_fs = dt_fs * log_interval
+        vels = np.zeros_like(pos)
         for i in range(steps):
             if i == 0:
-                delta_r = frames[1].get_positions() - frames[0].get_positions()
-                dt_step = frame_dt
+                vels[i] = (pos[1] - pos[0]) / frame_dt_fs
             elif i == steps - 1:
-                delta_r = frames[-1].get_positions() - frames[-2].get_positions()
-                dt_step = frame_dt
+                vels[i] = (pos[-1] - pos[-2]) / frame_dt_fs
             else:
-                delta_r = frames[i + 1].get_positions() - frames[i - 1].get_positions()
-                dt_step = 2 * frame_dt
-            delta_r_mic, _ = find_mic(delta_r, cell, pbc)
-            vels[i] = delta_r_mic / dt_step
+                vels[i] = (pos[i + 1] - pos[i - 1]) / (2.0 * frame_dt_fs)
 
     return vels
 
 
-def _calculate_vacf(frames, dt_fs, log_interval=1):
-    """Velocity autocorrelation function C_v(t), normalized to C_v(0) = 1."""
-    vels = _get_velocities(frames, dt_fs, log_interval)
+def _vacf_unnormalized(vels):
+    """Σ_{i,α} ⟨v_{iα}(0) v_{iα}(t)⟩ via scipy.signal.correlate (user workflow)."""
     steps, atoms, dims = vels.shape
     vacf = np.zeros(steps)
     for i in range(atoms):
@@ -153,13 +144,42 @@ def _calculate_vacf(frames, dt_fs, log_interval=1):
             v = vels[:, i, j]
             corr = correlate(v, v, mode='full')
             vacf += corr[steps - 1:] / np.arange(steps, 0, -1)
+    return vacf
 
+
+def _calculate_vacf(frames, dt_fs, log_interval=1):
+    """Normalized VACF C(t)/C(0); lag axis in fs."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
+    vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
         raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
-    vacf = vacf / vacf[0]
+    lag_fs = np.arange(len(vacf)) * dt_fs * log_interval
+    return vacf / vacf[0], lag_fs
 
-    lag_ps = np.arange(steps) * dt_fs * log_interval * 1e-3
-    return vacf, lag_ps
+
+def _vacf_integration_cutoff(vacf_norm):
+    """Integrate VACF until the first zero crossing (standard GK practice)."""
+    for k in range(1, len(vacf_norm)):
+        if vacf_norm[k] <= 0.0:
+            return k
+    return max(2, 3 * len(vacf_norm) // 4)
+
+
+def _green_kubo_diffusion(frames, dt_fs, log_interval=1):
+    """Self-diffusion from Green–Kubo: D = (1/(3N)) ∫₀^t_c ⟨Σ_i v_i(0)·v_i(t)⟩ dt."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
+    n_atoms = len(frames[0])
+    vacf = _vacf_unnormalized(vels)
+    if vacf[0] == 0.0:
+        raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
+
+    dt_frame_s = dt_fs * log_interval * 1e-15
+    lag_s = np.arange(len(vacf)) * dt_frame_s
+    vacf_norm = vacf / vacf[0]
+    cutoff = _vacf_integration_cutoff(vacf_norm)
+
+    integral = np.trapz(vacf[:cutoff], lag_s[:cutoff])
+    return integral / (3.0 * n_atoms) * 1e-5
 
 
 def _aimd_dt_params(cfg, dt_fs, log_int):
@@ -183,39 +203,22 @@ def traj_dt_params(traj_path, cfg):
 
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
-    """Vibrational DOS from MD: power spectrum of the normalized VACF.
+    """VDOS from windowed normalized VACF (rfft.real.clip, same as user workflow)."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
+    vacf = _vacf_unnormalized(vels)
+    if vacf[0] == 0.0:
+        raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
+    vacf /= vacf[0]
 
-    Literature convention (e.g. VASP MD phonon spectra, vacf tools):
-      C(t) = <Σ_i v_i(0)·v_i(t)> / <Σ_i v_i(0)·v_i(0)>   with C(0) = 1
-      g(ω) = |∫ C(t) e^{-iωt} dt|²
-
-    Returns
-    -------
-    vdos : ndarray
-        One-sided phonon spectral function g(ω) (arbitrary units, ∝ |FFT|²·Δt).
-    vdos_pmf : ndarray
-        g(ω) / Σ g(ω) — discrete shape only; used for EMD, not for publication plots.
-    freqs_THz : ndarray
-    """
-    vacf, _ = _calculate_vacf(frames, dt_fs, log_interval)
     steps = len(vacf)
-    dt_s = dt_fs * log_interval * 1e-15
-
-    # Half-Hann window: take the right half of an odd-length full window.
-    # hann(2N-1)[N-1:] starts at exactly 1.0 (the peak) and ends at exactly
-    # 0.0, giving a smooth taper with no amplitude distortion at lag=0.
     window = hann(2 * steps - 1)[steps - 1:]
-    vacf_windowed = vacf * window
+    vdos_raw = np.fft.rfft(vacf * window).real.clip(0)
 
-    # Power spectrum of normalized VACF (VASP / standard MD phonon DOS).
-    ft = np.fft.rfft(vacf_windowed)
-    vdos = (np.abs(ft) ** 2) * dt_s
+    dt_frame_s = dt_fs * log_interval * 1e-15
+    freqs_thz = np.fft.rfftfreq(steps, d=dt_frame_s) * 1e-12
 
-    freqs_Hz = np.fft.rfftfreq(steps, d=dt_s)
-    freqs_THz = freqs_Hz * 1e-12
-
-    vdos_pmf = vdos / np.sum(vdos) if np.sum(vdos) > 0 else vdos
-    return vdos, vdos_pmf, freqs_THz
+    vdos_pmf = vdos_raw / np.sum(vdos_raw) if np.sum(vdos_raw) > 0 else vdos_raw
+    return vdos_raw, vdos_pmf, freqs_thz
     
 # --- 3. Main Validation Engine ---
 def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=None):
@@ -360,6 +363,21 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_MSD_vs_Time_A2"]  = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
+    # 7b. Diffusion coefficient — Green–Kubo (VACF integral)
+    if cfg.get("run_green_kubo", True):
+        try:
+            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
+            D_ref_gk = _green_kubo_diffusion(
+                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+            D_pred_gk = _green_kubo_diffusion(
+                pred_frames, dt_fs, log_interval=log_int)
+
+            res["D_ref_GK_m2_s"] = D_ref_gk
+            res["D_pred_GK_m2_s"] = D_pred_gk
+            res["D_GK_Error_m2_s"] = abs(D_ref_gk - D_pred_gk)
+        except Exception as e:
+            print(f"Warning: Could not compute Green–Kubo diffusion: {e}")
+
     # 8. Velocity Autocorrelation Function (VACF)
     if cfg.get("run_vacf", False):
         try:
@@ -377,13 +395,13 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
             ref_w = ref_vacf / ref_vacf.sum() if ref_vacf.sum() > 0 else ref_vacf
             pred_w = pred_vacf_interp / pred_vacf_interp.sum() if pred_vacf_interp.sum() > 0 else pred_vacf_interp
-            res["EMD_VACF_ps"] = wasserstein_distance(
+            res["EMD_VACF_fs"] = wasserstein_distance(
                 ref_vacf_lag, ref_vacf_lag, u_weights=ref_w, v_weights=pred_w
             )
 
-            raw_data["Ref_VACF_Lag_ps"] = ref_vacf_lag
+            raw_data["Ref_VACF_Lag_fs"] = ref_vacf_lag
             raw_data["Ref_VACF"] = ref_vacf
-            raw_data["Pred_VACF_Lag_ps"] = pred_vacf_lag
+            raw_data["Pred_VACF_Lag_fs"] = pred_vacf_lag
             raw_data["Pred_VACF"] = pred_vacf
         except Exception as e:
             print(f"Warning: Could not compute VACF: {e}")
