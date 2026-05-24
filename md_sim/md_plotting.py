@@ -199,12 +199,22 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
         cfg = {}
     plt.figure(figsize=(8, 5))
     lw = cfg.get("plot_style", {}).get("line_width", 2)
+    vdos_scale = cfg.get("plot_vdos_scale", "spectrum")
+    if cfg.get("plot_vdos_normalized", False):
+        vdos_scale = "area"
 
     if mode == "VACF":
-        xlabel, ylabel, title = "Time (fs)", "VACF", "Velocity Autocorrelation Function"
+        xlabel, ylabel, title = "Time (fs)", r"$C_v(t)$", "Velocity Autocorrelation Function"
         vacf_max_fs = cfg.get("plot_vacf_max_fs")
     else:
-        xlabel, ylabel, title = "Frequency (THz)", "Normalized Density of States", "VDOS"
+        xlabel = "Frequency (THz)"
+        title = r"Phonon spectral function $g(\omega)=|\int C(t)e^{-i\omega t}\,dt|^2$"
+        if vdos_scale == "area":
+            ylabel = r"$g(\omega)$ (shape PMF)"
+        elif vdos_scale == "peak":
+            ylabel = r"$g(\omega) / \max g(\omega)$"
+        else:
+            ylabel = r"$g(\omega)$ (a.u.)"
         vdos_xmax = cfg.get("plot_vdos_xmax", 100)
 
     for label, path in traj_dict.items():
@@ -228,7 +238,13 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
                     n = int(vacf_max_fs / (dt_fs * log_int))
                     x, y = x[:n], y[:n]
             else:
-                _, y, x = _calculate_vdos_spectrum(frames, dt_fs, log_interval=log_int)
+                g_omega, g_pmf, x = _calculate_vdos_spectrum(frames, dt_fs, log_interval=log_int)
+                if vdos_scale == "area":
+                    y = g_pmf
+                elif vdos_scale == "peak":
+                    y = g_omega / g_omega.max() if g_omega.max() > 0 else g_omega
+                else:
+                    y = g_omega
 
             plt.plot(x, y, label=label, linewidth=lw, alpha=0.85)
 
@@ -240,7 +256,7 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
 
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.title(f"{title} (frames {burn_in}+)")
+    plt.title(title)
     plt.legend()
     plt.grid(True, alpha=0.3)
     if mode == "VACF":

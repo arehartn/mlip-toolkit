@@ -1,0 +1,4 @@
+[console_scripts]
+md-relax = md_sim.relaxation:main
+md-sim = md_sim.run_simulation:main
+md-validate = md_sim.validation:main

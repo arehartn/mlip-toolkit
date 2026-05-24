@@ -26,6 +26,7 @@
   "plot_vdos_overlay": true,
   "plot_vacf_max_fs": 600,
   "plot_vdos_xmax": 100,
+  "plot_vdos_scale": "spectrum",
   "plot_parity": true,
   "plot_velocity_histogram": true,
   "output_dir": "plots",

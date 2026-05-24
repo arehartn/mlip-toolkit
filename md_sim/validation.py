@@ -107,32 +107,67 @@ def _calculate_msd(frames):
     return msd_arr
 
 
+def _velocities_from_positions(frames, dt_fs, log_interval=1):
+    """Central-difference velocities (Å/fs) from unwrapped Cartesian positions."""
+    pos = _unwrap_positions(frames)
+    steps = len(frames)
+    frame_dt_fs = dt_fs * log_interval
+    vels = np.zeros_like(pos)
+    for i in range(steps):
+        if i == 0:
+            vels[i] = (pos[1] - pos[0]) / frame_dt_fs
+        elif i == steps - 1:
+            vels[i] = (pos[-1] - pos[-2]) / frame_dt_fs
+        else:
+            vels[i] = (pos[i + 1] - pos[i - 1]) / (2.0 * frame_dt_fs)
+    return vels
+
+
+def _subtract_com_velocity(vels, masses):
+    """Remove center-of-mass drift (standard before VACF / VDOS)."""
+    vels = np.array(vels, dtype=float, copy=True)
+    for t in range(len(vels)):
+        vels[t] -= np.average(vels[t], weights=masses, axis=0)
+    return vels
+
+
+def _stored_velocities_usable(stored, pos_derived, min_frame_frac=0.9, max_rel_err=0.35):
+    """Reject AIMD stored velocities that are partial zeros or disagree with positions."""
+    if np.any(np.isnan(stored)):
+        return False
+    frame_speed = np.mean(np.linalg.norm(stored, axis=2), axis=1)
+    if np.mean(frame_speed > 1e-4) < min_frame_frac:
+        return False
+    pos_norm = np.linalg.norm(pos_derived)
+    if pos_norm < 1e-12:
+        return False
+    rel_err = np.linalg.norm(stored - pos_derived) / pos_norm
+    return rel_err <= max_rel_err
+
+
 def _get_velocities(frames, dt_fs, log_interval=1):
-    """Velocities (Å/fs) from trajectory; position fallback only if arrays are missing."""
+    """Velocities (Å/fs) for VACF/VDOS; position finite differences when stored data are bad."""
     steps = len(frames)
     if steps < 2:
         raise ValueError("Need at least 2 frames to estimate velocities.")
 
+    pos_derived = _velocities_from_positions(frames, dt_fs, log_interval)
+
     try:
-        vels = np.array([f.get_velocities() for f in frames], dtype=float)
-        usable = not np.any(np.isnan(vels)) and np.mean(np.linalg.norm(vels, axis=2)) > 1e-8
+        stored = np.array([f.get_velocities() for f in frames], dtype=float)
+        if _stored_velocities_usable(stored, pos_derived):
+            vels = stored
+        else:
+            print(
+                "    Warning: Stored velocities missing, partial zeros, or inconsistent "
+                "with positions — using unwrapped position finite differences."
+            )
+            vels = pos_derived
     except (TypeError, ValueError):
-        usable = False
+        print("    Warning: Velocities missing — computing from unwrapped positions...")
+        vels = pos_derived
 
-    if not usable:
-        print("    Warning: Velocities missing or unreliable — computing from unwrapped positions...")
-        pos = _unwrap_positions(frames)
-        frame_dt_fs = dt_fs * log_interval
-        vels = np.zeros_like(pos)
-        for i in range(steps):
-            if i == 0:
-                vels[i] = (pos[1] - pos[0]) / frame_dt_fs
-            elif i == steps - 1:
-                vels[i] = (pos[-1] - pos[-2]) / frame_dt_fs
-            else:
-                vels[i] = (pos[i + 1] - pos[i - 1]) / (2.0 * frame_dt_fs)
-
-    return vels
+    return _subtract_com_velocity(vels, frames[0].get_masses())
 
 
 def _vacf_unnormalized(vels):
@@ -203,7 +238,7 @@ def traj_dt_params(traj_path, cfg):
 
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
-    """VDOS from windowed normalized VACF (rfft.real.clip, same as user workflow)."""
+    """Phonon spectral function g(ω) = |∫ C(t) e^{-iωt} dt|² from windowed normalized VACF."""
     vels = _get_velocities(frames, dt_fs, log_interval)
     vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
@@ -211,10 +246,11 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
     vacf /= vacf[0]
 
     steps = len(vacf)
-    window = hann(2 * steps - 1)[steps - 1:]
-    vdos_raw = np.fft.rfft(vacf * window).real.clip(0)
-
     dt_frame_s = dt_fs * log_interval * 1e-15
+    window = hann(2 * steps - 1)[steps - 1:]
+    ft = np.fft.rfft(vacf * window)
+    vdos_raw = (np.abs(ft) ** 2) * dt_frame_s
+
     freqs_thz = np.fft.rfftfreq(steps, d=dt_frame_s) * 1e-12
 
     vdos_pmf = vdos_raw / np.sum(vdos_raw) if np.sum(vdos_raw) > 0 else vdos_raw
