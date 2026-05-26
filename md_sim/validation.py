@@ -214,7 +214,9 @@ def _green_kubo_diffusion(frames, dt_fs, log_interval=1):
     cutoff = _vacf_integration_cutoff(vacf_norm)
 
     integral = np.trapz(vacf[:cutoff], lag_s[:cutoff])
-    return integral / (3.0 * n_atoms) * 1e-5
+    # VACF is in (Å/fs)², lag_s in s → integral in Å²·s/fs² → m²/s via ×1e10
+    # (1 Å/fs)²·s = 10⁻²⁰ m² / (10⁻³⁰ s²) · s = 10¹⁰ m²/s
+    return integral / (3.0 * n_atoms) * 1e10
 
 
 def _aimd_dt_params(cfg, dt_fs, log_int):
