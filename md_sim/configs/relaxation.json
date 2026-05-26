@@ -4,6 +4,9 @@
   "model_variant": "large",
   "device": "cpu",
   "fmax": 0.01,
+  "max_steps": 500,
+  "relax_cell": false,
+  "optimizer": "lbfgs",
   "output_prefix": "relaxed_structure",
   "write_trajectory": true,
   "write_log": true

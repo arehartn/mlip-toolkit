@@ -81,24 +81,23 @@ def _get_angle_distribution(frames, rcut=3.0, bins=90):
     return norm_hists, hists, angle_centers
 
 # --- 2. Dynamical Utilities ---
-def _calculate_msd(frames):
-    """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
+def _unwrap_positions(frames):
+    """Unwrap Cartesian positions for triclinic cells (same logic as MSD)."""
     positions = np.array([f.get_positions() for f in frames])
-    cell_matrix = frames[0].get_cell().array  # 3×3, rows are lattice vectors
-
-    # Unwrap in fractional (scaled) coordinates so triclinic cells are handled
-    # correctly.  Cartesian unwrapping with cell.lengths() only works for
-    # orthogonal boxes; for any non-orthogonal cell it produces wrong jumps.
+    cell_matrix = frames[0].get_cell().array
     inv_cell = np.linalg.inv(cell_matrix)
-    scaled = positions @ inv_cell.T  # (n_frames, n_atoms, 3)
+    scaled = positions @ inv_cell.T
     for i in range(1, len(scaled)):
         delta_frac = scaled[i] - scaled[i - 1]
         scaled[i] -= np.round(delta_frac)
-    positions = scaled @ cell_matrix.T  # back to Cartesian
+    return scaled @ cell_matrix.T
+
+
+def _calculate_msd(frames):
+    """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
+    positions = _unwrap_positions(frames)
 
     n_frames, n_atoms, _ = positions.shape
-    # lag=0 is trivially 0 by definition; allocate length n_frames but only
-    # fill lags 1..n_frames-1 (lag 0 stays 0 as a placeholder for the curve).
     msd_arr = np.zeros(n_frames)
     for lag in range(1, n_frames):
         diff = positions[lag:] - positions[:-lag]
@@ -107,70 +106,157 @@ def _calculate_msd(frames):
 
     return msd_arr
 
-def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
-    vels = np.array([f.get_velocities() for f in frames])
-    
-    # Fallback if velocities are missing or effectively zero across the trajectory.
-    # Checking only frame 0 is not enough: AIMD formats (e.g. XDATCAR, vasprun.xml)
-    # often store velocities for some frames but not others, leaving most frames as
-    # zeros and producing a white-noise VACF.  Check the mean absolute velocity
-    # across all frames instead.
-    try:
-        mean_speed = np.mean(np.abs(vels.astype(float)))
-    except (TypeError, ValueError):
-        mean_speed = 0.0
-    if vels[0] is None or mean_speed < 1e-8:
-        print("    Warning: Valid velocities not found! Approximating from positions...")
-        steps, atoms = len(frames), len(frames[0])
-        vels = np.zeros((steps, atoms, 3))
-        cell, pbc = frames[0].get_cell(), frames[0].get_pbc()
-        frame_dt = dt_fs * log_interval
-        
-        for i in range(steps):
-            if i == 0:
-                delta_r = frames[1].get_positions() - frames[0].get_positions()
-                dt_step = frame_dt
-            elif i == steps - 1:
-                delta_r = frames[-1].get_positions() - frames[-2].get_positions()
-                dt_step = frame_dt
-            else:
-                delta_r = frames[i+1].get_positions() - frames[i-1].get_positions()
-                dt_step = 2 * frame_dt
-            delta_r_mic, _ = find_mic(delta_r, cell, pbc)
-            vels[i] = delta_r_mic / dt_step
 
+def _velocities_from_positions(frames, dt_fs, log_interval=1):
+    """Central-difference velocities (Å/fs) from unwrapped Cartesian positions."""
+    pos = _unwrap_positions(frames)
+    steps = len(frames)
+    frame_dt_fs = dt_fs * log_interval
+    vels = np.zeros_like(pos)
+    for i in range(steps):
+        if i == 0:
+            vels[i] = (pos[1] - pos[0]) / frame_dt_fs
+        elif i == steps - 1:
+            vels[i] = (pos[-1] - pos[-2]) / frame_dt_fs
+        else:
+            vels[i] = (pos[i + 1] - pos[i - 1]) / (2.0 * frame_dt_fs)
+    return vels
+
+
+def _subtract_com_velocity(vels, masses):
+    """Remove center-of-mass drift (standard before VACF / VDOS)."""
+    vels = np.array(vels, dtype=float, copy=True)
+    for t in range(len(vels)):
+        vels[t] -= np.average(vels[t], weights=masses, axis=0)
+    return vels
+
+
+def _stored_velocities_usable(stored, pos_derived, min_frame_frac=0.9, max_rel_err=0.35):
+    """Reject AIMD stored velocities that are partial zeros or disagree with positions."""
+    if np.any(np.isnan(stored)):
+        return False
+    frame_speed = np.mean(np.linalg.norm(stored, axis=2), axis=1)
+    if np.mean(frame_speed > 1e-4) < min_frame_frac:
+        return False
+    pos_norm = np.linalg.norm(pos_derived)
+    if pos_norm < 1e-12:
+        return False
+    rel_err = np.linalg.norm(stored - pos_derived) / pos_norm
+    return rel_err <= max_rel_err
+
+
+def _get_velocities(frames, dt_fs, log_interval=1):
+    """Velocities (Å/fs) for VACF/VDOS; position finite differences when stored data are bad."""
+    steps = len(frames)
+    if steps < 2:
+        raise ValueError("Need at least 2 frames to estimate velocities.")
+
+    pos_derived = _velocities_from_positions(frames, dt_fs, log_interval)
+
+    try:
+        stored = np.array([f.get_velocities() for f in frames], dtype=float)
+        if _stored_velocities_usable(stored, pos_derived):
+            vels = stored
+        else:
+            print(
+                "    Warning: Stored velocities missing, partial zeros, or inconsistent "
+                "with positions — using unwrapped position finite differences."
+            )
+            vels = pos_derived
+    except (TypeError, ValueError):
+        print("    Warning: Velocities missing — computing from unwrapped positions...")
+        vels = pos_derived
+
+    return _subtract_com_velocity(vels, frames[0].get_masses())
+
+
+def _vacf_unnormalized(vels):
+    """Σ_{i,α} ⟨v_{iα}(0) v_{iα}(t)⟩ via scipy.signal.correlate (user workflow)."""
     steps, atoms, dims = vels.shape
     vacf = np.zeros(steps)
     for i in range(atoms):
         for j in range(dims):
             v = vels[:, i, j]
             corr = correlate(v, v, mode='full')
-            vacf += corr[steps-1:] / np.arange(steps, 0, -1)
-            
-    # Normalize VACF so it starts at 1.0
+            vacf += corr[steps - 1:] / np.arange(steps, 0, -1)
+    return vacf
+
+
+def _calculate_vacf(frames, dt_fs, log_interval=1):
+    """Normalized VACF C(t)/C(0); lag axis in fs."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
+    vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
         raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
-    vacf = vacf / vacf[0]
+    lag_fs = np.arange(len(vacf)) * dt_fs * log_interval
+    return vacf / vacf[0], lag_fs
 
-    # Half-Hann window: take the right half of an odd-length full window.
-    # hann(2N-1)[N-1:] starts at exactly 1.0 (the peak) and ends at exactly
-    # 0.0, giving a smooth taper with no amplitude distortion at lag=0.
-    # Using hann(2N)[N:] is a common mistake — its first sample is ≈0.9998,
-    # not 1.0, and gets worse for short trajectories.
+
+def _vacf_integration_cutoff(vacf_norm):
+    """Integrate VACF until the first zero crossing (standard GK practice)."""
+    for k in range(1, len(vacf_norm)):
+        if vacf_norm[k] <= 0.0:
+            return k
+    return max(2, 3 * len(vacf_norm) // 4)
+
+
+def _green_kubo_diffusion(frames, dt_fs, log_interval=1):
+    """Self-diffusion from Green–Kubo: D = (1/(3N)) ∫₀^t_c ⟨Σ_i v_i(0)·v_i(t)⟩ dt."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
+    n_atoms = len(frames[0])
+    vacf = _vacf_unnormalized(vels)
+    if vacf[0] == 0.0:
+        raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
+
+    dt_frame_s = dt_fs * log_interval * 1e-15
+    lag_s = np.arange(len(vacf)) * dt_frame_s
+    vacf_norm = vacf / vacf[0]
+    cutoff = _vacf_integration_cutoff(vacf_norm)
+
+    integral = np.trapz(vacf[:cutoff], lag_s[:cutoff])
+    # VACF is in (Å/fs)², lag_s in s → integral in Å²·s/fs² → m²/s via ×1e10
+    # (1 Å/fs)²·s = 10⁻²⁰ m² / (10⁻³⁰ s²) · s = 10¹⁰ m²/s
+    return integral / (3.0 * n_atoms) * 1e10
+
+
+def _aimd_dt_params(cfg, dt_fs, log_int):
+    """AIMD frame spacing; None / missing keys fall back to MLIP dt_fs and log_interval."""
+    aimd_dt = cfg.get("aimd_dt_fs")
+    aimd_log = cfg.get("aimd_log_interval")
+    return (
+        dt_fs if aimd_dt is None else aimd_dt,
+        log_int if aimd_log is None else aimd_log,
+    )
+
+
+def traj_dt_params(traj_path, cfg):
+    """Return (dt_fs, log_interval) for a trajectory path (AIMD vs MLIP)."""
+    log_int = cfg.get("log_interval", 1)
+    dt_fs = cfg.get("dt_fs", 1.0)
+    ref = cfg.get("reference_traj_file")
+    if ref and Path(traj_path).resolve() == Path(ref).resolve():
+        return _aimd_dt_params(cfg, dt_fs, log_int)
+    return dt_fs, log_int
+
+
+def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
+    """Phonon spectral function g(ω) = |∫ C(t) e^{-iωt} dt|² from windowed normalized VACF."""
+    vels = _get_velocities(frames, dt_fs, log_interval)
+    vacf = _vacf_unnormalized(vels)
+    if vacf[0] == 0.0:
+        raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
+    vacf /= vacf[0]
+
+    steps = len(vacf)
+    dt_frame_s = dt_fs * log_interval * 1e-15
     window = hann(2 * steps - 1)[steps - 1:]
-    vacf_windowed = vacf * window
+    ft = np.fft.rfft(vacf * window)
+    vdos_raw = (np.abs(ft) ** 2) * dt_frame_s
 
-    # The VACF is real and symmetric so by the Wiener–Khinchin theorem its
-    # Fourier transform is real and non-negative.  Use np.real + clip(0)
-    # rather than np.abs, which would inflate tiny negative numerical artefacts
-    # at high frequencies into spurious positive spectral density.
-    vdos = np.fft.rfft(vacf_windowed).real.clip(0)
-    
-    freqs_Hz = np.fft.rfftfreq(steps, d=dt_fs * log_interval * 1e-15)
-    freqs_THz = freqs_Hz * 1e-12 
-    
-    norm_vdos = vdos / np.sum(vdos) if np.sum(vdos) > 0 else vdos
-    return norm_vdos, vdos, freqs_THz
+    freqs_thz = np.fft.rfftfreq(steps, d=dt_frame_s) * 1e-12
+
+    vdos_pmf = vdos_raw / np.sum(vdos_raw) if np.sum(vdos_raw) > 0 else vdos_raw
+    return vdos_raw, vdos_pmf, freqs_thz
     
 # --- 3. Main Validation Engine ---
 def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=None):
@@ -274,9 +360,10 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
         raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
 
+    log_int = cfg.get("log_interval", 1)
+
     # 7. Diffusion Coefficient from MSD (Einstein relation: MSD = 6*D*t)
     if cfg.get("run_msd", True):
-        log_int = cfg.get("log_interval", 1)
         # Physical time between saved frames in seconds
         dt_frame_s = dt_fs * log_int * 1e-15
 
@@ -314,40 +401,80 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_MSD_vs_Time_A2"]  = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
-    # 8. Vibrational Density of States (VDOS)
+    # 7b. Diffusion coefficient — Green–Kubo (VACF integral)
+    if cfg.get("run_green_kubo", True):
+        try:
+            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
+            D_ref_gk = _green_kubo_diffusion(
+                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+            D_pred_gk = _green_kubo_diffusion(
+                pred_frames, dt_fs, log_interval=log_int)
+
+            res["D_ref_GK_m2_s"] = D_ref_gk
+            res["D_pred_GK_m2_s"] = D_pred_gk
+            res["D_GK_Error_m2_s"] = abs(D_ref_gk - D_pred_gk)
+        except Exception as e:
+            print(f"Warning: Could not compute Green–Kubo diffusion: {e}")
+
+    # 8. Velocity Autocorrelation Function (VACF)
+    if cfg.get("run_vacf", False):
+        try:
+            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
+
+            ref_vacf, ref_vacf_lag = _calculate_vacf(
+                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+            pred_vacf, pred_vacf_lag = _calculate_vacf(
+                pred_frames, dt_fs, log_interval=log_int)
+
+            if len(ref_vacf) != len(pred_vacf):
+                pred_vacf_interp = np.interp(ref_vacf_lag, pred_vacf_lag, pred_vacf)
+            else:
+                pred_vacf_interp = pred_vacf
+
+            ref_w = ref_vacf / ref_vacf.sum() if ref_vacf.sum() > 0 else ref_vacf
+            pred_w = pred_vacf_interp / pred_vacf_interp.sum() if pred_vacf_interp.sum() > 0 else pred_vacf_interp
+            res["EMD_VACF_fs"] = wasserstein_distance(
+                ref_vacf_lag, ref_vacf_lag, u_weights=ref_w, v_weights=pred_w
+            )
+
+            raw_data["Ref_VACF_Lag_fs"] = ref_vacf_lag
+            raw_data["Ref_VACF"] = ref_vacf
+            raw_data["Pred_VACF_Lag_fs"] = pred_vacf_lag
+            raw_data["Pred_VACF"] = pred_vacf
+        except Exception as e:
+            print(f"Warning: Could not compute VACF: {e}")
+
+    # 9. Vibrational Density of States (VDOS)
     if cfg.get("run_vdos", False):
         try:
             # AIMD and MACE trajectories can have different timesteps and output
             # intervals.  Use aimd_dt_fs / aimd_log_interval for the reference if
             # provided; fall back to the MACE values if not.
-            aimd_dt_fs       = cfg.get("aimd_dt_fs",       dt_fs)
-            aimd_log_interval = cfg.get("aimd_log_interval", log_int)
+            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
 
-            ref_vdos_norm,  ref_vdos_raw,  ref_vdos_freq  = _calculate_vdos_spectrum(
-                ref_frames,  aimd_dt_fs, log_interval=aimd_log_interval)
-            pred_vdos_norm, pred_vdos_raw, pred_vdos_freq = _calculate_vdos_spectrum(
-                pred_frames, dt_fs,      log_interval=log_int)
+            ref_vdos, ref_vdos_pmf, ref_vdos_freq = _calculate_vdos_spectrum(
+                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+            pred_vdos, pred_vdos_pmf, pred_vdos_freq = _calculate_vdos_spectrum(
+                pred_frames, dt_fs, log_interval=log_int)
 
-            # EMD: if spectra have different lengths (different frame counts or dt),
-            # interpolate pred onto ref's frequency grid before computing.
-            if len(ref_vdos_norm) != len(pred_vdos_norm):
-                pred_norm_interp = np.interp(ref_vdos_freq, pred_vdos_freq, pred_vdos_norm)
-                pred_norm_interp /= pred_norm_interp.sum()
+            # EMD on spectral shape (PMF), not on raw g(ω) amplitudes.
+            if len(ref_vdos_pmf) != len(pred_vdos_pmf):
+                pred_pmf_interp = np.interp(ref_vdos_freq, pred_vdos_freq, pred_vdos_pmf)
+                pred_pmf_interp /= pred_pmf_interp.sum()
             else:
-                pred_norm_interp = pred_vdos_norm
+                pred_pmf_interp = pred_vdos_pmf
 
             res["EMD_VDOS_THz"] = wasserstein_distance(
                 ref_vdos_freq, ref_vdos_freq,
-                u_weights=ref_vdos_norm, v_weights=pred_norm_interp
+                u_weights=ref_vdos_pmf, v_weights=pred_pmf_interp
             )
 
-            # Separate freq axis per trajectory so columns always align correctly.
-            raw_data["Ref_VDOS_Freq_THz"]      = ref_vdos_freq
-            raw_data["Ref_VDOS_Raw_Intensity"]  = ref_vdos_raw
-            raw_data["Ref_VDOS_Norm_Prob"]      = ref_vdos_norm
-            raw_data["Pred_VDOS_Freq_THz"]      = pred_vdos_freq
-            raw_data["Pred_VDOS_Raw_Intensity"] = pred_vdos_raw
-            raw_data["Pred_VDOS_Norm_Prob"]     = pred_vdos_norm
+            raw_data["Ref_VDOS_Freq_THz"] = ref_vdos_freq
+            raw_data["Ref_VDOS_g_omega"] = ref_vdos
+            raw_data["Ref_VDOS_Shape_PMF"] = ref_vdos_pmf
+            raw_data["Pred_VDOS_Freq_THz"] = pred_vdos_freq
+            raw_data["Pred_VDOS_g_omega"] = pred_vdos
+            raw_data["Pred_VDOS_Shape_PMF"] = pred_vdos_pmf
         except Exception as e:
             print(f"Warning: Could not compute VDOS: {e}")
 

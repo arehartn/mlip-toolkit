@@ -25,6 +25,8 @@
   "make_plots": false,
   "plot_thermo": true,
   "plot_structural_overlays": true,
+  "plot_vacf_overlay": true,
+  "plot_vdos_overlay": true,
   "plot_parity": true,
   "plot_velocity_histogram": true,
   "output_dir": "./plots",
@@ -46,5 +48,6 @@
   "run_adf": false,
   "run_cv": false,
   "run_msd": false,
+  "run_vacf": false,
   "run_vdos": false
 }
