@@ -401,21 +401,143 @@ def _get_kinetic_energy(frame, temp_k=None):
     return 0.0
 
 
-def _diagnose_kinetic_energy(frames, label, temp_k):
+_KIN_CSV_DEFAULTS = (
+    "energy_kin_eV", "energy_kin", "E_kin_eV", "E_kin",
+    "Kinetic_Energy", "KE", "ekin",
+)
+_POT_CSV_DEFAULTS = (
+    "energy_pot_eV", "energy_pot", "E_pot_eV", "E_pot",
+    "Potential_Energy", "PE", "epot",
+)
+
+
+def _find_csv_column(df, cfg, custom_key, defaults):
+    """Resolve a thermo CSV column using config overrides then common names."""
+    for col in list(cfg.get(custom_key, []) or []) + list(defaults):
+        if col in df.columns:
+            return col
+    return None
+
+
+def _resolve_reference_summary_csv(cfg):
+    """AIMD thermo CSV: explicit path, else first entry in compare_csvs."""
+    explicit = cfg.get("reference_summary_csv")
+    if explicit:
+        path = Path(explicit)
+        if path.is_file():
+            return path
+        print(f"Warning: reference_summary_csv not found: {path}")
+
+    compare = cfg.get("compare_csvs") or {}
+    if isinstance(compare, dict) and compare:
+        path = Path(next(iter(compare.values())))
+        if path.is_file():
+            return path
+        print(f"Warning: compare_csvs reference not found: {path}")
+    elif compare:
+        path = Path(compare[0])
+        if path.is_file():
+            return path
+    return None
+
+
+def _resolve_predicted_summary_csv(cfg):
+    pred_csv = cfg.get("summary_csv")
+    if pred_csv and Path(pred_csv).is_file():
+        return Path(pred_csv)
+    return None
+
+
+def _require_reference_summary_csv(cfg):
+    path = _resolve_reference_summary_csv(cfg)
+    if path is None:
+        raise ValueError(
+            "Reference thermo CSV required: set reference_summary_csv or compare_csvs "
+            "to the AIMD summary CSV used for thermo plots (E_pot_eV, E_kin_eV)."
+        )
+    return path
+
+
+def _load_thermo_energies_from_csv(csv_path, cfg, burn_in=0):
+    """Total potential and kinetic energy time series (eV) from one thermo CSV."""
+    df = pd.read_csv(csv_path)
+    epot_col = _find_csv_column(df, cfg, "custom_pot_cols", _POT_CSV_DEFAULTS)
+    ekin_col = _find_csv_column(df, cfg, "custom_kin_cols", _KIN_CSV_DEFAULTS)
+    if epot_col is None:
+        raise ValueError(
+            f"No potential energy column in {csv_path}. "
+            f"Available: {list(df.columns)}. Set custom_pot_cols in config."
+        )
+    if ekin_col is None:
+        raise ValueError(
+            f"No kinetic energy column in {csv_path}. "
+            f"Available: {list(df.columns)}. Set custom_kin_cols in config."
+        )
+    epot = df[epot_col].astype(float).to_numpy()
+    ekin = df[ekin_col].astype(float).to_numpy()
+    if burn_in > 0:
+        epot = epot[burn_in:]
+        ekin = ekin[burn_in:]
+    return epot, ekin, epot_col, ekin_col
+
+
+def _load_side_thermo_energies(cfg, burn_in, side, frames, temp_k):
+    """Epot and Ekin (eV) from thermo CSV; predicted side falls back to trajectory."""
+    label = "Reference" if side == "reference" else "Predicted"
+    if side == "reference":
+        csv_path = _require_reference_summary_csv(cfg)
+    else:
+        csv_path = _resolve_predicted_summary_csv(cfg)
+
+    if csv_path is not None:
+        epot, ekin, epot_col, ekin_col = _load_thermo_energies_from_csv(
+            csv_path, cfg, burn_in)
+        print(f"  {label}: CSV {csv_path}")
+        print(f"    Epot [{epot_col}] ({len(epot)} pts), Ekin [{ekin_col}] ({len(ekin)} pts)")
+        sources = {
+            "epot": f"csv:{csv_path}:{epot_col}",
+            "ekin": f"csv:{csv_path}:{ekin_col}",
+        }
+        return epot, ekin, sources
+
+    print(f"  Warning: {label} summary_csv not found — falling back to trajectory.")
+    epot = np.array([_get_potential_energy(f) for f in frames], dtype=float)
+    ekin = np.array([_get_kinetic_energy(f, temp_k) for f in frames], dtype=float)
+    return epot, ekin, {"epot": "trajectory", "ekin": "trajectory"}
+
+
+def _align_energy_series(ref_epot, pred_epot, ref_ekin, pred_ekin):
+    """Trim energy series to a common length."""
+    n = min(len(ref_epot), len(pred_epot), len(ref_ekin), len(pred_ekin))
+    lengths = {
+        "ref_epot": len(ref_epot),
+        "pred_epot": len(pred_epot),
+        "ref_ekin": len(ref_ekin),
+        "pred_ekin": len(pred_ekin),
+    }
+    if n < max(lengths.values()):
+        print(
+            f"  Warning: thermo length mismatch {lengths}; using first {n} points."
+        )
+    return (
+        ref_epot[:n], pred_epot[:n],
+        ref_ekin[:n], pred_ekin[:n],
+    )
+
+
+def _print_kinetic_energy_diagnostics(label, ke_total, n_atoms, temp_k, source):
     """Print mean KE and flag values inconsistent with equipartition at temp_k."""
-    n_atoms = len(frames[0])
-    ke = np.array([_get_kinetic_energy(f, temp_k) for f in frames])
     expected = _expected_kinetic_energy(n_atoms, temp_k)
     print(
-        f"  {label} KE: mean={ke.mean():.3f} eV ({ke.mean() / n_atoms:.5f} eV/atom), "
-        f"expected≈{expected:.3f} eV at {temp_k} K"
+        f"    {label} Ekin: mean={ke_total.mean():.3f} eV "
+        f"({ke_total.mean() / n_atoms:.5f} eV/atom), "
+        f"expected≈{expected:.3f} eV at {temp_k} K [{source}]"
     )
-    if expected > 0 and not _plausible_kinetic_energy(ke.mean(), n_atoms, temp_k):
+    if expected > 0 and not _plausible_kinetic_energy(ke_total.mean(), n_atoms, temp_k):
         print(
-            f"    Warning: {label} mean kinetic energy differs strongly from "
-            f"3/2 N k_B T — check trajectory velocity units or use AIMD metadata."
+            f"    Warning: {label} mean Ekin differs strongly from 3/2 N k_B T — "
+            "check compare_csvs / summary_csv paths and custom_kin_cols."
         )
-    return ke
 
 
 # --- 3. Main Validation Engine ---
@@ -444,20 +566,36 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     res = {}
     raw_data = {}
 
+    ref_epot_total = pred_epot_total = ref_ekin_total = pred_ekin_total = None
+
+    if cfg.get("run_energy", True) or cfg.get("run_cv", True):
+        print("Thermo energies from summary CSV (same source as thermo plots):")
+        try:
+            ref_epot_total, ref_ekin_total, ref_src = _load_side_thermo_energies(
+                cfg, burn_in, "reference", ref_frames, temp_k)
+            pred_epot_total, pred_ekin_total, pred_src = _load_side_thermo_energies(
+                cfg, burn_in, "predicted", pred_frames, temp_k)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return None
+
+        ref_epot_total, pred_epot_total, ref_ekin_total, pred_ekin_total = (
+            _align_energy_series(
+                ref_epot_total, pred_epot_total, ref_ekin_total, pred_ekin_total)
+        )
+
     # 1-2. Energy Distributions
     if cfg.get("run_energy", True):
-        ref_epot_total = np.array([_get_potential_energy(f) for f in ref_frames])
-        pred_epot_total = np.array([_get_potential_energy(f) for f in pred_frames])
         ref_epot = ref_epot_total / n_ref
         pred_epot = pred_epot_total / n_pred
-        # Per-atom EMD (dimensionless scale-invariant comparison)
         res["EMD_Epot_eV_atom"] = wasserstein_distance(ref_epot, pred_epot)
-        # Raw total-energy EMD: result has units of eV (same as the quantity being compared)
         res["EMD_Epot_eV_raw"] = wasserstein_distance(ref_epot_total, pred_epot_total)
 
-        print("Kinetic energy diagnostics (equipartition check at target T):")
-        ref_ekin_total = _diagnose_kinetic_energy(ref_frames, "Reference", temp_k)
-        pred_ekin_total = _diagnose_kinetic_energy(pred_frames, "Predicted", temp_k)
+        _print_kinetic_energy_diagnostics(
+            "Reference", ref_ekin_total, n_ref, temp_k, ref_src["ekin"])
+        _print_kinetic_energy_diagnostics(
+            "Predicted", pred_ekin_total, n_pred, temp_k, pred_src["ekin"])
+
         ref_ekin = ref_ekin_total / n_ref
         pred_ekin = pred_ekin_total / n_pred
         res["EMD_Ekin_eV_atom"] = wasserstein_distance(ref_ekin, pred_ekin)
@@ -518,14 +656,14 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["ADF_Ref_Norm_Prob"] = ref_adf_norm
         raw_data["ADF_Pred_Norm_Prob"] = pred_adf_norm
 
-    # 6. Heat Capacity (Cv) Error
+    # 6. Heat Capacity (Cv) Error — same CSV Epot series as run_energy
     if cfg.get("run_cv", True):
-        ref_epot_tot = np.array([_get_potential_energy(f) for f in ref_frames])
-        pred_epot_tot = np.array([_get_potential_energy(f) for f in pred_frames])
-        res["Cv_Error_eV_K_atom"] = abs(np.var(ref_epot_tot) - np.var(pred_epot_tot)) / (kb * temp_k**2 * n_ref)
-        
-        raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
-        raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
+        res["Cv_Error_eV_K_atom"] = abs(
+            np.var(ref_epot_total) - np.var(pred_epot_total)
+        ) / (kb * temp_k**2 * n_ref)
+
+        raw_data["Ref_Total_Epot_eV"] = ref_epot_total
+        raw_data["Pred_Total_Epot_eV"] = pred_epot_total
 
     log_int = cfg.get("log_interval", 1)
 
