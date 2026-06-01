@@ -257,7 +257,289 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
 
     vdos_pmf = vdos_raw / np.sum(vdos_raw) if np.sum(vdos_raw) > 0 else vdos_raw
     return vdos_raw, vdos_pmf, freqs_thz
-    
+
+
+KB_EV_K = 8.617333262145e-5
+
+
+def _expected_kinetic_energy(n_atoms, temp_k):
+    """Equipartition kinetic energy (eV) for 3N degrees of freedom at temp_k."""
+    return 1.5 * n_atoms * KB_EV_K * temp_k
+
+
+def _plausible_kinetic_energy(ke, n_atoms, temp_k, tol=0.25):
+    """True when ke is within tol of the equipartition value at temp_k."""
+    if ke is None or not np.isfinite(ke) or ke <= 0:
+        return False
+    if temp_k is None or temp_k <= 0:
+        return True
+    expected = _expected_kinetic_energy(n_atoms, temp_k)
+    if expected <= 0:
+        return True
+    ratio = ke / expected
+    return (1.0 - tol) <= ratio <= (1.0 + tol) * 4.0
+
+
+def _get_potential_energy(frame):
+    """Extract potential energy (eV); mirrors md_plotting._get_energy for AIMD metadata."""
+    if frame.calc is not None:
+        if hasattr(frame.calc, "results"):
+            if "energy" in frame.calc.results:
+                return float(frame.calc.results["energy"])
+            if "free_energy" in frame.calc.results:
+                return float(frame.calc.results["free_energy"])
+        try:
+            return float(frame.get_potential_energy())
+        except Exception:
+            pass
+
+    for key in ("energy", "REF_energy", "dft_energy", "Energy", "E", "free_energy", "E_pot_eV"):
+        if key in frame.info:
+            return float(frame.info[key])
+
+    return float(frame.get_potential_energy())
+
+
+def _get_forces(frame):
+    """Extract forces (eV/Å); mirrors md_plotting._get_forces for AIMD metadata."""
+    if frame.calc is not None:
+        try:
+            return np.asarray(frame.get_forces(), dtype=float)
+        except Exception:
+            pass
+
+    for key in ("forces", "REF_forces", "dft_forces", "Forces", "force"):
+        if key in frame.arrays:
+            return np.asarray(frame.arrays[key], dtype=float)
+
+    return np.asarray(frame.get_forces(), dtype=float)
+
+
+def _kinetic_energy_from_velocities(frame):
+    """Kinetic energy (eV) from the velocities array, or None if unusable."""
+    try:
+        v = frame.get_velocities()
+    except (TypeError, ValueError):
+        return None
+    if v is None:
+        return None
+    v = np.asarray(v, dtype=float)
+    if v.shape != (len(frame), 3) or np.any(np.isnan(v)):
+        return None
+    if np.mean(np.linalg.norm(v, axis=1)) < 1e-8:
+        return None
+    return float(frame.get_kinetic_energy())
+
+
+def _kinetic_energy_from_metadata(frame, n_atoms):
+    """Candidate total kinetic energies (eV) stored on AIMD frames."""
+    candidates = []
+    for key in (
+        "kinetic_energy", "E_kin", "E_kin_eV", "KE", "kin_energy",
+        "energy_kin_eV", "energy_kin",
+    ):
+        if key not in frame.info:
+            continue
+        val = float(frame.info[key])
+        candidates.append(val)
+        # Some VASP/ASE converters store per-atom KE under a total-energy key name.
+        if val < 1.0:
+            candidates.append(val * n_atoms)
+    return candidates
+
+
+def _kinetic_energy_from_temperature(frame, n_atoms):
+    """Infer total KE (eV) from an instantaneous temperature in frame.info."""
+    for key in ("temperature", "Temperature", "temp", "temp_inst_K", "temperature_K"):
+        if key in frame.info:
+            temp = float(frame.info[key])
+            if temp > 0:
+                return _expected_kinetic_energy(n_atoms, temp)
+    return None
+
+
+def _get_kinetic_energy(frame, temp_k=None):
+    """Robust kinetic energy (eV) for validation.
+
+    AIMD trajectories often carry correct KE in frame.info (from OUTCAR) while
+    the velocities array is missing or in non-ASE units.  Thermo CSV plots use
+    the parsed OUTCAR values, so we must not trust get_kinetic_energy() alone.
+    """
+    n_atoms = len(frame)
+    vel_ke = _kinetic_energy_from_velocities(frame)
+    meta_candidates = _kinetic_energy_from_metadata(frame, n_atoms)
+    temp_ke = _kinetic_energy_from_temperature(frame, n_atoms)
+
+    if vel_ke is not None and _plausible_kinetic_energy(vel_ke, n_atoms, temp_k):
+        return vel_ke
+
+    for cand in meta_candidates:
+        if _plausible_kinetic_energy(cand, n_atoms, temp_k):
+            return cand
+
+    if temp_ke is not None and _plausible_kinetic_energy(temp_ke, n_atoms, temp_k):
+        return temp_ke
+
+    if meta_candidates:
+        best = meta_candidates[0]
+        if not _plausible_kinetic_energy(best, n_atoms, temp_k):
+            print(
+                "    Warning: Using metadata kinetic energy without equipartition "
+                f"confirmation ({best:.3f} eV total)."
+            )
+        return best
+
+    if vel_ke is not None:
+        if not _plausible_kinetic_energy(vel_ke, n_atoms, temp_k):
+            print(
+                f"    Warning: Velocity-derived KE ({vel_ke:.3f} eV) is inconsistent "
+                f"with 3/2 N k_B T at {temp_k} K — metric may be unreliable."
+            )
+        return vel_ke
+    if temp_ke is not None:
+        return temp_ke
+    return 0.0
+
+
+_KIN_CSV_DEFAULTS = (
+    "energy_kin_eV", "energy_kin", "E_kin_eV", "E_kin",
+    "Kinetic_Energy", "KE", "ekin",
+)
+_POT_CSV_DEFAULTS = (
+    "energy_pot_eV", "energy_pot", "E_pot_eV", "E_pot",
+    "Potential_Energy", "PE", "epot",
+)
+
+
+def _find_csv_column(df, cfg, custom_key, defaults):
+    """Resolve a thermo CSV column using config overrides then common names."""
+    for col in list(cfg.get(custom_key, []) or []) + list(defaults):
+        if col in df.columns:
+            return col
+    return None
+
+
+def _resolve_reference_summary_csv(cfg):
+    """AIMD thermo CSV: explicit path, else first entry in compare_csvs."""
+    explicit = cfg.get("reference_summary_csv")
+    if explicit:
+        path = Path(explicit)
+        if path.is_file():
+            return path
+        print(f"Warning: reference_summary_csv not found: {path}")
+
+    compare = cfg.get("compare_csvs") or {}
+    if isinstance(compare, dict) and compare:
+        path = Path(next(iter(compare.values())))
+        if path.is_file():
+            return path
+        print(f"Warning: compare_csvs reference not found: {path}")
+    elif compare:
+        path = Path(compare[0])
+        if path.is_file():
+            return path
+    return None
+
+
+def _resolve_predicted_summary_csv(cfg):
+    pred_csv = cfg.get("summary_csv")
+    if pred_csv and Path(pred_csv).is_file():
+        return Path(pred_csv)
+    return None
+
+
+def _require_reference_summary_csv(cfg):
+    path = _resolve_reference_summary_csv(cfg)
+    if path is None:
+        raise ValueError(
+            "Reference thermo CSV required: set reference_summary_csv or compare_csvs "
+            "to the AIMD summary CSV used for thermo plots (E_pot_eV, E_kin_eV)."
+        )
+    return path
+
+
+def _load_thermo_energies_from_csv(csv_path, cfg, burn_in=0):
+    """Total potential and kinetic energy time series (eV) from one thermo CSV."""
+    df = pd.read_csv(csv_path)
+    epot_col = _find_csv_column(df, cfg, "custom_pot_cols", _POT_CSV_DEFAULTS)
+    ekin_col = _find_csv_column(df, cfg, "custom_kin_cols", _KIN_CSV_DEFAULTS)
+    if epot_col is None:
+        raise ValueError(
+            f"No potential energy column in {csv_path}. "
+            f"Available: {list(df.columns)}. Set custom_pot_cols in config."
+        )
+    if ekin_col is None:
+        raise ValueError(
+            f"No kinetic energy column in {csv_path}. "
+            f"Available: {list(df.columns)}. Set custom_kin_cols in config."
+        )
+    epot = df[epot_col].astype(float).to_numpy()
+    ekin = df[ekin_col].astype(float).to_numpy()
+    if burn_in > 0:
+        epot = epot[burn_in:]
+        ekin = ekin[burn_in:]
+    return epot, ekin, epot_col, ekin_col
+
+
+def _load_side_thermo_energies(cfg, burn_in, side, frames, temp_k):
+    """Epot and Ekin (eV) from thermo CSV; predicted side falls back to trajectory."""
+    label = "Reference" if side == "reference" else "Predicted"
+    if side == "reference":
+        csv_path = _require_reference_summary_csv(cfg)
+    else:
+        csv_path = _resolve_predicted_summary_csv(cfg)
+
+    if csv_path is not None:
+        epot, ekin, epot_col, ekin_col = _load_thermo_energies_from_csv(
+            csv_path, cfg, burn_in)
+        print(f"  {label}: CSV {csv_path}")
+        print(f"    Epot [{epot_col}] ({len(epot)} pts), Ekin [{ekin_col}] ({len(ekin)} pts)")
+        sources = {
+            "epot": f"csv:{csv_path}:{epot_col}",
+            "ekin": f"csv:{csv_path}:{ekin_col}",
+        }
+        return epot, ekin, sources
+
+    print(f"  Warning: {label} summary_csv not found — falling back to trajectory.")
+    epot = np.array([_get_potential_energy(f) for f in frames], dtype=float)
+    ekin = np.array([_get_kinetic_energy(f, temp_k) for f in frames], dtype=float)
+    return epot, ekin, {"epot": "trajectory", "ekin": "trajectory"}
+
+
+def _align_energy_series(ref_epot, pred_epot, ref_ekin, pred_ekin):
+    """Trim energy series to a common length."""
+    n = min(len(ref_epot), len(pred_epot), len(ref_ekin), len(pred_ekin))
+    lengths = {
+        "ref_epot": len(ref_epot),
+        "pred_epot": len(pred_epot),
+        "ref_ekin": len(ref_ekin),
+        "pred_ekin": len(pred_ekin),
+    }
+    if n < max(lengths.values()):
+        print(
+            f"  Warning: thermo length mismatch {lengths}; using first {n} points."
+        )
+    return (
+        ref_epot[:n], pred_epot[:n],
+        ref_ekin[:n], pred_ekin[:n],
+    )
+
+
+def _print_kinetic_energy_diagnostics(label, ke_total, n_atoms, temp_k, source):
+    """Print mean KE and flag values inconsistent with equipartition at temp_k."""
+    expected = _expected_kinetic_energy(n_atoms, temp_k)
+    print(
+        f"    {label} Ekin: mean={ke_total.mean():.3f} eV "
+        f"({ke_total.mean() / n_atoms:.5f} eV/atom), "
+        f"expected≈{expected:.3f} eV at {temp_k} K [{source}]"
+    )
+    if expected > 0 and not _plausible_kinetic_energy(ke_total.mean(), n_atoms, temp_k):
+        print(
+            f"    Warning: {label} mean Ekin differs strongly from 3/2 N k_B T — "
+            "check compare_csvs / summary_csv paths and custom_kin_cols."
+        )
+
+
 # --- 3. Main Validation Engine ---
 def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=None):
     if cfg is None: cfg = {}
@@ -270,29 +552,52 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         print(f"Error loading trajectories: {e}")
         return None
 
-    kb = 8.617333262145e-5 # eV/K
-    n_atoms = len(ref_frames[0])
+    kb = KB_EV_K
+    n_ref = len(ref_frames[0])
+    n_pred = len(pred_frames[0])
+    if n_ref != n_pred:
+        print(
+            f"Warning: atom count mismatch — reference={n_ref}, predicted={n_pred}. "
+            "Per-atom metrics use each trajectory's own atom count."
+        )
 
     print(f"Validating {len(ref_frames)} AIMD frames vs {len(pred_frames)} MACE frames...")
     
     res = {}
     raw_data = {}
 
+    ref_epot_total = pred_epot_total = ref_ekin_total = pred_ekin_total = None
+
+    if cfg.get("run_energy", True) or cfg.get("run_cv", True):
+        print("Thermo energies from summary CSV (same source as thermo plots):")
+        try:
+            ref_epot_total, ref_ekin_total, ref_src = _load_side_thermo_energies(
+                cfg, burn_in, "reference", ref_frames, temp_k)
+            pred_epot_total, pred_ekin_total, pred_src = _load_side_thermo_energies(
+                cfg, burn_in, "predicted", pred_frames, temp_k)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return None
+
+        ref_epot_total, pred_epot_total, ref_ekin_total, pred_ekin_total = (
+            _align_energy_series(
+                ref_epot_total, pred_epot_total, ref_ekin_total, pred_ekin_total)
+        )
+
     # 1-2. Energy Distributions
     if cfg.get("run_energy", True):
-        ref_epot_total = np.array([f.get_potential_energy() for f in ref_frames])
-        pred_epot_total = np.array([f.get_potential_energy() for f in pred_frames])
-        ref_epot = ref_epot_total / n_atoms
-        pred_epot = pred_epot_total / n_atoms
-        # Per-atom EMD (dimensionless scale-invariant comparison)
+        ref_epot = ref_epot_total / n_ref
+        pred_epot = pred_epot_total / n_pred
         res["EMD_Epot_eV_atom"] = wasserstein_distance(ref_epot, pred_epot)
-        # Raw total-energy EMD: result has units of eV (same as the quantity being compared)
         res["EMD_Epot_eV_raw"] = wasserstein_distance(ref_epot_total, pred_epot_total)
 
-        ref_ekin_total = np.array([f.get_kinetic_energy() for f in ref_frames])
-        pred_ekin_total = np.array([f.get_kinetic_energy() for f in pred_frames])
-        ref_ekin = ref_ekin_total / n_atoms
-        pred_ekin = pred_ekin_total / n_atoms
+        _print_kinetic_energy_diagnostics(
+            "Reference", ref_ekin_total, n_ref, temp_k, ref_src["ekin"])
+        _print_kinetic_energy_diagnostics(
+            "Predicted", pred_ekin_total, n_pred, temp_k, pred_src["ekin"])
+
+        ref_ekin = ref_ekin_total / n_ref
+        pred_ekin = pred_ekin_total / n_pred
         res["EMD_Ekin_eV_atom"] = wasserstein_distance(ref_ekin, pred_ekin)
         res["EMD_Ekin_eV_raw"] = wasserstein_distance(ref_ekin_total, pred_ekin_total)
 
@@ -307,8 +612,8 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
     # 3. Force Magnitude Distributions
     if cfg.get("run_forces", True):
-        ref_f_mag = np.linalg.norm(np.vstack([f.get_forces() for f in ref_frames]), axis=1)
-        pred_f_mag = np.linalg.norm(np.vstack([f.get_forces() for f in pred_frames]), axis=1)
+        ref_f_mag = np.linalg.norm(np.vstack([_get_forces(f) for f in ref_frames]), axis=1)
+        pred_f_mag = np.linalg.norm(np.vstack([_get_forces(f) for f in pred_frames]), axis=1)
         res["EMD_Forces_eV_A"] = wasserstein_distance(ref_f_mag, pred_f_mag)
         
         raw_data["Ref_Force_Mag_eV_A"] = ref_f_mag
@@ -351,27 +656,28 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["ADF_Ref_Norm_Prob"] = ref_adf_norm
         raw_data["ADF_Pred_Norm_Prob"] = pred_adf_norm
 
-    # 6. Heat Capacity (Cv) Error
+    # 6. Heat Capacity (Cv) Error — same CSV Epot series as run_energy
     if cfg.get("run_cv", True):
-        ref_epot_tot = np.array([f.get_potential_energy() for f in ref_frames])
-        pred_epot_tot = np.array([f.get_potential_energy() for f in pred_frames])
-        res["Cv_Error_eV_K_atom"] = abs(np.var(ref_epot_tot) - np.var(pred_epot_tot)) / (kb * temp_k**2 * n_atoms)
-        
-        raw_data["Ref_Total_Epot_eV"] = ref_epot_tot
-        raw_data["Pred_Total_Epot_eV"] = pred_epot_tot
+        res["Cv_Error_eV_K_atom"] = abs(
+            np.var(ref_epot_total) - np.var(pred_epot_total)
+        ) / (kb * temp_k**2 * n_ref)
+
+        raw_data["Ref_Total_Epot_eV"] = ref_epot_total
+        raw_data["Pred_Total_Epot_eV"] = pred_epot_total
 
     log_int = cfg.get("log_interval", 1)
 
     # 7. Diffusion Coefficient from MSD (Einstein relation: MSD = 6*D*t)
     if cfg.get("run_msd", True):
-        # Physical time between saved frames in seconds
-        dt_frame_s = dt_fs * log_int * 1e-15
+        aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
+        ref_dt_frame_s = aimd_dt_fs * aimd_log_interval * 1e-15
+        pred_dt_frame_s = dt_fs * log_int * 1e-15
 
-        ref_msd_arr  = _calculate_msd(ref_frames)
+        ref_msd_arr = _calculate_msd(ref_frames)
         pred_msd_arr = _calculate_msd(pred_frames)
 
-        n_lags = len(ref_msd_arr)
-        time_s = np.arange(n_lags) * dt_frame_s  # seconds
+        ref_time_s = np.arange(len(ref_msd_arr)) * ref_dt_frame_s
+        pred_time_s = np.arange(len(pred_msd_arr)) * pred_dt_frame_s
 
         def _diffusion_coeff(msd_arr, time_s):
             """Fit MSD[25%:75%] vs t to extract D = slope/6 in m²/s.
@@ -389,16 +695,16 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             slope = np.polyfit(time_s[lo:hi], msd_arr[lo:hi], 1)[0]  # Å²/s
             return slope / 6.0 * 1e-20  # convert Å²/s → m²/s
 
-        D_ref  = _diffusion_coeff(ref_msd_arr,  time_s)
-        D_pred = _diffusion_coeff(pred_msd_arr, time_s)
+        D_ref = _diffusion_coeff(ref_msd_arr, ref_time_s)
+        D_pred = _diffusion_coeff(pred_msd_arr, pred_time_s)
 
-        res["D_ref_m2_s"]   = D_ref
-        res["D_pred_m2_s"]  = D_pred
+        res["D_ref_m2_s"] = D_ref
+        res["D_pred_m2_s"] = D_pred
         res["D_Error_m2_s"] = abs(D_ref - D_pred)
 
-        # Keep MSD time-axis in ps for human-readable CSV
-        raw_data["MSD_Time_ps"]         = time_s * 1e12
-        raw_data["Ref_MSD_vs_Time_A2"]  = ref_msd_arr
+        # Keep MSD time-axis in ps for human-readable CSV (reference trajectory axis)
+        raw_data["MSD_Time_ps"] = ref_time_s * 1e12
+        raw_data["Ref_MSD_vs_Time_A2"] = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
     # 7b. Diffusion coefficient — Green–Kubo (VACF integral)
