@@ -324,7 +324,7 @@ mlip-toolkit/
 
 Batatia, I., Kovács, D. P., Simm, G. N. C., Ortner, C., & Csányi, G. (2022). MACE: Higher Order Equivariant Message Passing Neural Networks for Fast and Accurate Force Fields. *Advances in Neural Information Processing Systems*.
 
-The research poster describing this work — *Is There a Better, More Affordable Alternative to AIMD? Validating Foundational MLIPs on Solid-State Sodium Ionic Conductors* — is included at [`docs/Final_Poster.pdf`](docs/Final_Poster.pdf).
+The research poster describing this work — *Is There a Better, More Affordable Alternative to AIMD? Validating Foundational MLIPs on Solid-State Sodium Ionic Conductors* — is included at [`Final_Poster.pdf`](Final_Poster.pdf).
 
 ---
 
