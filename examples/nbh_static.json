@@ -1,0 +1,28 @@
+{
+  "job": "static",
+
+  "input_structure": "/users/PAS3201/arehartn/NBH_MLIP_data/mixed_phase/POSCAR",
+  "reference_structure": "/users/PAS3201/arehartn/NBH_MLIP_data/mixed_phase/POSCAR",
+  "model_type": "mace",
+  "model_variant": "medium-0b2",
+  "device": "cuda",
+
+  "fmax": 0.01,
+  "max_steps": 1000,
+  "optimizer": "lbfgs",
+  "output_prefix": "mace_medium-0b2_static",
+
+  "run_relax_energy": true,
+  "run_lattice": true,
+  "run_position_rmsd": true,
+  "run_bond_lengths": true,
+  "bond_cutoff_mult": 1.2,
+  "run_space_group": true,
+  "symprec_list": [0.001, 0.01, 0.1],
+
+  "run_phonon_dos": true,
+  "phonon_structure": "variable",
+  "phonon_supercell": [1, 1, 1],
+  "phonon_smearing_thz": 0.5,
+  "reference_phonon_dos_file": null
+}

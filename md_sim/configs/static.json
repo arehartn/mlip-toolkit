@@ -1,0 +1,32 @@
+{
+  "input_structure": "POSCAR",
+  "reference_structure": null,
+  "model_type": "mace",
+  "model_variant": "large",
+  "device": "cpu",
+
+  "fmax": 0.01,
+  "max_steps": 500,
+  "optimizer": "lbfgs",
+  "output_prefix": "static",
+  "write_trajectory": true,
+  "static_output_csv": null,
+
+  "run_relax_energy": true,
+  "run_lattice": true,
+  "run_position_rmsd": true,
+  "run_bond_lengths": true,
+  "bond_cutoff_mult": 1.2,
+  "run_space_group": true,
+  "symprec_list": [0.001, 0.01, 0.1],
+
+  "run_phonon_dos": false,
+  "phonon_structure": "variable",
+  "phonon_supercell": [1, 1, 1],
+  "phonon_kpts": null,
+  "phonon_delta": 0.01,
+  "phonon_smearing_thz": 0.5,
+  "phonon_npts": 1000,
+  "phonon_imag_tol_thz": 0.1,
+  "reference_phonon_dos_file": null
+}

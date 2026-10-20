@@ -23,4 +23,4 @@ conda activate mace_env_gpu
 
 # 3. Run every *.json config found in this directory
 #    (see run_all.py -- dispatches by each config's "job" field)
-python run_all.py > job.log
+python /path/to/mlip-toolkit/examples/run_all.py > job.log

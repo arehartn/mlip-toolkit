@@ -6,6 +6,7 @@ Each JSON needs a top-level "job" field:
   "md"          - molecular dynamics
   "relaxation"  - structure relaxation
   "validation"  - trajectory validation (+ plots if make_plots is true)
+  "static"      - static (0 K) validation against a reference structure
 
 Example:
     cd my_job_folder
@@ -20,6 +21,7 @@ from md_sim import validation, md_plotting
 from md_sim.config import load_config
 from md_sim.relaxation import run as run_relax
 from md_sim.run_simulation import run as run_md
+from md_sim.static_validation import run as run_static
 
 
 def run_validation(path: Path) -> None:
@@ -34,21 +36,28 @@ def main() -> None:
     if not configs:
         sys.exit("No *.json files found. cd into your job folder first.")
 
+    # Check every config before running anything, so a bad file
+    # doesn't stop the batch halfway through.
+    jobs = []
     for path in configs:
         with path.open(encoding="utf-8") as f:
             job = json.load(f).get("job")
 
-        if job not in ("md", "relaxation", "validation"):
+        if job not in ("md", "relaxation", "validation", "static"):
             sys.exit(
-                f'{path.name}: set "job" to "md", "relaxation", or "validation"'
+                f'{path.name}: set "job" to "md", "relaxation", "validation", or "static"'
             )
+        jobs.append((path, job))
 
+    for path, job in jobs:
         print(f"\n--- {path.name} ({job}) ---")
 
         if job == "md":
             run_md(config_path=path)
         elif job == "relaxation":
             run_relax(config_path=path)
+        elif job == "static":
+            run_static(config_path=path)
         else:
             run_validation(path)
 

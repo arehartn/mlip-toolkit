@@ -23,7 +23,12 @@ except ImportError:
 
 def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant="large", device="cpu", head=None):
     atoms = read(structure_path)
-    
+    atoms.calc = make_calculator(model_type, model_variant, device, head)
+    return atoms
+
+
+def make_calculator(model_type="mace", model_variant="large", device="cpu", head=None):
+    """Build the MLIP calculator without attaching it to a structure."""
     if model_type.lower() == "mace":
         print(f"Initializing MACE ({model_variant}) calculator...")
         
@@ -53,13 +58,13 @@ def setup_atoms_and_calculator(structure_path, model_type="mace", model_variant=
         else:
             chgnet_model = CHGNet.load(model_name=model_variant)
             
-        calc = CHGNetCalculator(model=chgnet_model, use_device=device, compute_stress=False)
+        # Stress is needed for variable-cell relaxation (static validation)
+        calc = CHGNetCalculator(model=chgnet_model, use_device=device, compute_stress=True)
         
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    atoms.calc = calc
-    return atoms
+    return calc
 
 def initialize_velocities(atoms, temperature_K, stationary=True, zero_rotation=False):
     """Initialize velocities from a Maxwell-Boltzmann distribution.
@@ -75,11 +80,14 @@ def initialize_velocities(atoms, temperature_K, stationary=True, zero_rotation=F
     if zero_rotation:
         ZeroRotation(atoms)
 
-def setup_dynamics(atoms, temperature_K, dt_fs, friction):
+def setup_dynamics(atoms, temperature_K, dt_fs, friction, fixcm=True):
+    """Langevin NVT. Pass fixcm=False when a FixCom constraint is attached
+    (ASE's fixcm=True does not sample NVT exactly and is deprecated)."""
     dyn = Langevin(atoms,
                    timestep=dt_fs * units.fs,
                    temperature_K=temperature_K,
-                   friction=friction)
+                   friction=friction,
+                   fixcm=fixcm)
     return dyn
 
 def apply_fix_com(atoms):

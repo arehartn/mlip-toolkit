@@ -4,6 +4,7 @@ import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from pathlib import Path
+from ase import units
 from ase.io import read
 
 # --- Import validation logic to prevent duplicate math ---
@@ -14,6 +15,7 @@ try:
         _calculate_vacf,
         _calculate_vdos_spectrum,
         traj_dt_params,
+        snapshot_traj_paths,
     )
 except ImportError:
     # Fallback in case the script is run directly in the same folder
@@ -23,6 +25,7 @@ except ImportError:
         _calculate_vacf,
         _calculate_vdos_spectrum,
         traj_dt_params,
+        snapshot_traj_paths,
     )
 
 try:
@@ -73,7 +76,14 @@ def generate_plots(cfg):
         _plot_structural_overlay(trajs_to_plot, out_dir / "adf_overlay.png", mode="ADF", burn_in=burn_in, cfg=cfg)
 
     if cfg.get("plot_parity", True):
-        if ref_traj and Path(ref_traj).exists() and curr_traj and Path(curr_traj).exists():
+        snap_ref, snap_mlip = snapshot_traj_paths(cfg)
+        if snap_ref.exists() and snap_mlip.exists():
+            # MLIP single points on the reference frames: a true parity comparison
+            plot_parity(snap_ref, snap_mlip, str(out_dir / "accuracy_parity"), cfg=cfg)
+        elif ref_traj and Path(ref_traj).exists() and curr_traj and Path(curr_traj).exists():
+            print("Warning: parity plot pairs frame i of two independent trajectories, "
+                  "which are different configurations. Set run_snapshot_errors: true "
+                  "for a true parity plot.")
             plot_parity(ref_traj, curr_traj, str(out_dir / "accuracy_parity"), cfg=cfg)
         elif ref_traj:
             print(f"Skipping parity plots. Ensure both trajectories exist.\n"
@@ -565,7 +575,7 @@ def _plot_velocity_histogram(atoms_csv, out_path):
     ]
     
     for ax, (col, label, color) in zip(axes, components):
-        ax.hist(df_last[col], bins=50, alpha=0.7, color=color, density=True, label=label)
+        ax.hist(df_last[col] * units.fs, bins=50, alpha=0.7, color=color, density=True, label=label)
         ax.set_ylabel("Density")
         ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3)

@@ -22,6 +22,7 @@ The package was developed to benchmark MACE against AIMD on solid-state sodium i
 - [Validation metrics](#validation-metrics)
 - [Implementation notes](#implementation-notes)
 - [Benchmark results](#benchmark-results)
+- [Known limitations and ongoing work](#known-limitations-and-ongoing-work)
 - [Repository layout](#repository-layout)
 - [Roadmap](#roadmap)
 - [Citation and references](#citation-and-references)
@@ -47,7 +48,7 @@ cd mlip-toolkit
 pip install -e .
 ```
 
-This installs `numpy`, `ase`, and `mace-torch`, along with three console entry points: `md-sim`, `md-relax`, and `md-validate`.
+This installs `numpy`, `scipy`, `pandas`, `matplotlib`, `ase`, and `mace-torch`, along with three console entry points: `md-sim`, `md-relax`, and `md-validate`.
 
 On a shared cluster, install into a dedicated conda environment rather than the base environment, as GPU-enabled PyTorch and MACE builds are large and version-sensitive:
 
@@ -58,7 +59,7 @@ conda activate mace_env_gpu
 pip install -e .
 ```
 
-CHGNet support requires `pip install chgnet` separately; it is only imported when `model_type` is set to `chgnet`.
+CHGNet support requires `pip install chgnet` (or `pip install -e .[chgnet]`); it is only imported when `model_type` is set to `chgnet`.
 
 ---
 
@@ -80,6 +81,7 @@ python /path/to/mlip-toolkit/examples/run_all.py
 | `"relaxation"` | `md_sim.relaxation.run` | Relaxed structure |
 | `"md"` | `md_sim.run_simulation.run` | `.traj` trajectory, summary CSV, per-atom CSV |
 | `"validation"` | `md_sim.validation.run` | Scalar metrics CSV, raw distributions CSV, plots |
+| `"static"` | `md_sim.static_validation.run` | Relaxed structures, static metrics CSV, bond-by-bond CSV, phonon DOS |
 
 Individual entry points are also available for single jobs:
 
@@ -87,6 +89,7 @@ Individual entry points are also available for single jobs:
 md-relax   --config relax.json
 md-sim     --config md.json
 md-validate --config validation.json
+md-static   --config static.json
 ```
 
 or from Python:
@@ -157,6 +160,24 @@ The package ships default configs at `md_sim/configs/simulation.json` and `md_si
 | `run_energy`, `run_forces`, `run_rdf`, `run_adf`, `run_cv`, `run_msd`, `run_green_kubo`, `run_vacf`, `run_vdos` | Per-metric toggles |
 | `aimd_dt_fs`, `aimd_log_interval` | Overrides for references logged at a different cadence than the MLIP run |
 | `validation_output_csv` | Destination for scalar metrics |
+| `run_snapshot_errors`, `snapshot_stride`, `snapshot_max_frames` | MLIP single points on reference frames: energy / force / stress MAE and RMSE, per-element force errors; feeds the parity plots. Uses `model_type` / `model_variant` / `device` / `head` from the same config |
+| `structure_frame_stride` | Use every Nth frame for RDF / ADF / partial RDF (default 1) |
+| `run_partial_rdf`, `partial_rdf_pairs` | Partial *g*<sub>ab</sub>(r); all element pairs unless pairs are listed, e.g. `[["B","H"],["Na","B"]]` |
+| `run_element_msd`, `run_element_vacf`, `run_element_vdos` | Per-element MSD (+ Green–Kubo if `run_green_kubo`), VACF, VDOS |
+| `run_vdos_peaks`, `vdos_peak_*` | VDOS peak detection and matching (smoothing, prominence, max frequency, tolerance) |
+
+**Static validation** (`"job": "static"`)
+
+| Key | Description |
+|---|---|
+| `input_structure` | Starting structure for the MLIP relaxations |
+| `reference_structure` | Reference (DFT-relaxed) structure; defaults to `input_structure` |
+| `run_relax_energy` | Fixed- and variable-cell relaxation energies; ΔE(fixed − variable) |
+| `run_lattice` | Lattice parameters and volume vs. reference |
+| `run_position_rmsd` | Atomic position RMSD (total and per element) |
+| `run_bond_lengths`, `bond_cutoff_mult` | Bond-by-bond lengths grouped by element pair |
+| `run_space_group`, `symprec_list` | Space group (spglib) at several tolerances |
+| `run_phonon_dos`, `phonon_*` | Harmonic phonon DOS via finite displacements; imaginary modes; optional `reference_phonon_dos_file` |
 
 Any config may set `make_plots: true` alongside individual `plot_*` flags to emit thermodynamic traces, RDF/ADF overlays, VACF/VDOS overlays, energy and force parity plots, and velocity histograms, styled via the `plot_style` block.
 
@@ -181,14 +202,14 @@ module purge
 module load miniconda3/24.1.2-py310
 conda activate mace_env_gpu
 
-python run_all.py > job.log
+python /path/to/mlip-toolkit/examples/run_all.py > job.log
 ```
 
 Submit from the directory containing the job's config:
 
 ```bash
 cd run_2/
-sbatch submit_osc_cardinal.sh
+sbatch submit_osc_job.sh
 ```
 
 The same script serves both MD and validation stages without modification, since the dispatcher acts on whichever config is present in the working directory.
@@ -201,11 +222,15 @@ The same script serves both MD and validation stages without modification, since
 
 | Category | Observables |
 |---|---|
+| Snapshot accuracy | Energy (raw and offset-removed), force and stress errors of MLIP single points on the reference configurations; per-element force errors; force direction cosine |
 | Energetics | Potential and kinetic energy distributions (per-atom and system total); heat capacity error from energy variance |
 | Forces | Force-magnitude distribution |
 | Structure | Radial distribution function *g(r)*; angular distribution function |
 | Transport | Mean squared displacement → Einstein diffusion coefficient; Green–Kubo diffusion coefficient |
-| Vibrational | Velocity autocorrelation function; vibrational density of states |
+| Vibrational | Velocity autocorrelation function; vibrational density of states; VDOS peak positions |
+| Element-resolved | Partial RDFs for every element pair (first-peak position and EMD); per-element MSD, Green–Kubo, VACF, VDOS |
+
+`md_sim/static_validation.py` covers the 0 K side: MLIP forces and pressure at the reference geometry, fixed- and variable-cell relaxations, lattice parameters, position RMSD, bond lengths, space group, and the harmonic phonon DOS with an imaginary-mode check.
 
 Each metric is independently toggleable. In addition to scalar scores, the underlying distributions are written to a `*_RAW_DATA.csv` companion file for downstream analysis and custom plotting.
 
@@ -217,8 +242,8 @@ Several details in the validation pipeline address failure modes that are easy t
 
 - **Kinetic energy extraction.** AIMD trajectories frequently contain missing, zeroed, or unit-inconsistent velocities. Velocity-derived kinetic energy is cross-checked against trajectory metadata and an equipartition estimate (3/2 *N* k_B*T*) before being accepted, with explicit warnings on fallback rather than silent propagation of invalid values.
 - **Velocity reconstruction.** Where stored velocities are unusable, velocities are recovered by central-difference differentiation of periodic-boundary-unwrapped positions, with center-of-mass drift removed prior to VACF and VDOS computation.
-- **MSD fitting window.** Mean squared displacement is computed from unwrapped coordinates over multiple time origins. The diffusion coefficient is fit to the central 25–75% of the curve, excluding the short-time ballistic regime and the long-time tail where few time origins contribute.
-- **Green–Kubo diffusion.** *D* = (1/3*N*) ∫₀^tc ⟨Σᵢ **v**ᵢ(0)·**v**ᵢ(*t*)⟩ d*t*, integrated to the first zero crossing of the VACF. Because this estimator derives from the velocity autocorrelation rather than the MSD slope, it provides an independent check on transport properties and is markedly less sensitive to fitting-window artifacts in short trajectories.
+- **MSD fitting window.** Mean squared displacement is computed from unwrapped, centre-of-mass-corrected coordinates over multiple time origins. The log-log slope α of MSD vs. *t* over the fit window is reported (`MSD_alpha_*`); D is only meaningful where α ≈ 1. The diffusion coefficient is fit to the central 25–75% of the curve, excluding the short-time ballistic regime and the long-time tail where few time origins contribute.
+- **Green–Kubo diffusion.** *D* = (1/3*N*) ∫₀^tc ⟨Σᵢ **v**ᵢ(0)·**v**ᵢ(*t*)⟩ d*t*, currently integrated to the first zero crossing of the VACF. This truncation captures mainly the short-time vibrational part of the VACF and yields a nonzero *D* even for a non-diffusing crystal, so the current GK values should not be read as a converged transport estimate (see [Known limitations](#known-limitations-and-ongoing-work)).
 - **VDOS comparison.** The vibrational density of states is obtained from a Hann-windowed FFT of the normalized VACF and compared as a normalized spectral distribution, so that spectra differing in amplitude scale but not in shape are not penalized disproportionately.
 - **Timestep reconciliation.** `aimd_dt_fs` and `aimd_log_interval` permit comparison of trajectories logged at differing intervals without manual resampling.
 - **RDF normalization.** *g(r)* is normalized against ideal-gas pair counts only; additional normalization by number density is a common error that flattens the resulting distribution.
@@ -276,11 +301,21 @@ Configuration: `model_variant="large-0b2"`, `head="mp_pbe_refit_add"`, `dt_fs=0.
 
 Findings:
 
-- **Transport is reproduced at the correct order of magnitude.** Green–Kubo and Einstein estimators agree to within a factor of two on both the reference and predicted trajectories, establishing that the earlier inability to interpret NBH diffusion reflected MSD convergence at short trajectory lengths rather than a failure of the potential to capture ion transport.
-- **MACE underestimates the diffusion coefficient** by approximately 20% under the Green–Kubo estimator and 52% under the Einstein estimator. Given the Green–Kubo estimator's lower sensitivity to fitting-window effects in short trajectories, the former is the more reliable figure.
+- **Diffusion is not yet converged.** The Green–Kubo values agree between MACE and AIMD, but the GK integral is truncated at the first VACF zero crossing and therefore mostly reflects short-time vibrational dynamics, which MACE reproduces well. The MSD curves, which probe longer times, diverge: the MACE MSD grows faster than the AIMD MSD. With 0.1–0.6 ps of analyzed trajectory, neither estimate represents converged long-range transport, and the diffusion figures in the table should not be interpreted as a validated result.
+- **Possible origins of the MSD divergence** under investigation: systematic softening of the foundation-model potential energy surface (tested via the force parity slope on reference snapshots), differences between the Langevin thermostat and the AIMD thermostat, and short-trajectory statistics.
 - **Energetic agreement is substantially improved** relative to the initial survey, with per-atom potential and kinetic energy EMD reduced by roughly a factor of five and two orders of magnitude respectively. This reflects both the larger model variant and revisions to kinetic energy extraction and reference alignment in the validation pipeline.
 
-These figures derive from a single production run rather than a systematic sweep, and should be treated as provisional pending replication across friction and trajectory-length conditions.
+These figures derive from a single production run rather than a systematic sweep, and should be treated as provisional pending replication across friction and trajectory-length conditions. They were also produced before the pipeline fixes listed below.
+
+---
+
+## Known limitations and ongoing work
+
+- **Green–Kubo truncation.** GK diffusion is integrated only to the first VACF zero crossing; it will be replaced by a full running integral with plateau detection.
+- **Trajectory length.** Analyzed trajectories of 0.1–0.6 ps are too short for converged diffusion. The reported `MSD_alpha` exponent (α ≈ 1 for diffusive motion) is used to flag this.
+- **No uncertainty estimates yet.** All results come from single trajectories; multi-seed runs and block averaging are planned.
+- **VDOS definition.** The vibrational spectrum is currently computed as |FT(C(t))|², which preserves peak positions but distorts relative intensities compared with the standard FT(C(t)).
+- **Pipeline fixes after the benchmarks above.** Stored ASE velocities are now converted to Å/fs (they were previously always rejected in favour of finite-difference velocities); centre-of-mass drift is now removed from the MSD; the benchmark numbers will be regenerated with the current code.
 
 ---
 
@@ -296,15 +331,17 @@ mlip-toolkit/
 │   ├── run_simulation.py      # MD driver with seed locking
 │   ├── md_plotting.py         # Thermodynamic, structural, and spectral plotting
 │   ├── validation.py          # EMD-based validation engine
+│   ├── static_validation.py   # 0 K structure / phonon validation
 │   └── configs/
 │       ├── simulation.json    # Default MD parameters
-│       └── relaxation.json    # Default relaxation parameters
+│       ├── relaxation.json    # Default relaxation parameters
+│       └── static.json        # Default static-validation parameters
 ├── examples/
 │   ├── nbh_700K.json          # Worked MD configuration
+│   ├── nbh_static.json        # Worked static-validation configuration
 │   ├── run_all.py             # Config dispatcher (primary entry point)
-│   └── submit_osc_cardinal.sh # Example Slurm batch script
-├── docs/
-│   └── Final_Poster.pdf       # Research poster
+│   └── submit_osc_job.sh      # Example Slurm batch script
+├── Final_Poster.pdf           # Research poster
 └── setup.py
 ```
 
@@ -312,6 +349,7 @@ mlip-toolkit/
 
 ## Roadmap
 
+- Re-run the NBH benchmarks with the current pipeline, including snapshot errors and element-resolved MSD.
 - Replicate the large-0b2 configuration across the full friction and trajectory-length grid to confirm the improvements observed in the single follow-up run.
 - Extend Green–Kubo cross-validation to NNOC and the remaining NBH phases.
 - Characterize the residual ~20% underestimation of the diffusion coefficient.

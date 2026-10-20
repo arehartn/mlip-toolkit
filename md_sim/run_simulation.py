@@ -80,6 +80,7 @@ def run(config=None, config_path=None, config_overrides=None):
         temperature_K=cfg["temp_kelvin"],
         dt_fs=cfg["dt_fs"],
         friction=cfg["friction"],
+        fixcm=not cfg.get("fix_com", False),
     )
 
     logger = md_tools.MDLogger(atoms, dyn, cfg)
@@ -88,12 +89,13 @@ def run(config=None, config_path=None, config_overrides=None):
     dyn.run(cfg["n_steps"])
     print("Simulation Complete.")
 
-    if cfg.get("make_plots", False):
-        md_plotting.generate_plots(cfg)
-
     if cfg.get("run_validation", False):
         print("\n--- Transitioning to Validation Phase ---")
         validation.run(config=cfg)
+
+    # After validation, so parity plots can use the snapshot single points
+    if cfg.get("make_plots", False):
+        md_plotting.generate_plots(cfg)
 
 
 def main():

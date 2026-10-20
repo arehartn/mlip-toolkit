@@ -1,11 +1,17 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from ase import units
 from ase.io import read
 from scipy.stats import wasserstein_distance
-from scipy.signal import correlate
+from itertools import combinations_with_replacement
+from scipy.signal import correlate, find_peaks
+from scipy.ndimage import gaussian_filter1d
 from ase.geometry import find_mic
 from scipy.signal.windows import hann
+
+# np.trapz was removed in NumPy 2.x; np.trapezoid replaces it.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 
 # --- 1. Structural Utilities ---
 def _get_distance_distribution(frames, rmax=6.0, bins=100):
@@ -93,11 +99,20 @@ def _unwrap_positions(frames):
     return scaled @ cell_matrix.T
 
 
-def _calculate_msd(frames):
-    """Calculates MSD using unwrapped coordinates and multiple time origins (literature standard)."""
-    positions = _unwrap_positions(frames)
+def _com_free_positions(frames):
+    """Unwrapped positions with the system centre-of-mass motion removed.
 
-    n_frames, n_atoms, _ = positions.shape
+    The MLIP run uses FixCom, but AIMD references usually do not, so any COM
+    drift in the reference would otherwise inflate its MSD.
+    """
+    positions = _unwrap_positions(frames)
+    com = np.average(positions, axis=1, weights=frames[0].get_masses())
+    return positions - com[:, None, :]
+
+
+def _msd_from_positions(positions):
+    """MSD over multiple time origins from (n_frames, n_atoms, 3) positions."""
+    n_frames = positions.shape[0]
     msd_arr = np.zeros(n_frames)
     for lag in range(1, n_frames):
         diff = positions[lag:] - positions[:-lag]
@@ -105,6 +120,48 @@ def _calculate_msd(frames):
         msd_arr[lag] = np.mean(sq_dist)
 
     return msd_arr
+
+
+def _calculate_msd(frames, indices=None):
+    """Calculates MSD using unwrapped, COM-free coordinates and multiple time origins.
+
+    indices : optional atom indices (e.g. one element) to average over.
+    """
+    positions = _com_free_positions(frames)
+    if indices is not None:
+        positions = positions[:, indices]
+    return _msd_from_positions(positions)
+
+
+def _msd_fit_window(n):
+    """Middle 25–75% of lag times: skips the ballistic regime and the noisy tail."""
+    return n // 4, 3 * n // 4
+
+
+def _msd_diffusion_coeff(msd_arr, time_s):
+    """Fit MSD[25%:75%] vs t to extract D = slope/6 in m²/s."""
+    n = len(msd_arr)
+    lo, hi = _msd_fit_window(n)
+    if hi - lo < 2:
+        # Trajectory too short for a reliable fit; fall back to endpoint
+        return msd_arr[-1] / (6.0 * time_s[-1]) * 1e-20 if time_s[-1] > 0 else 0.0
+    slope = np.polyfit(time_s[lo:hi], msd_arr[lo:hi], 1)[0]  # Å²/s
+    return slope / 6.0 * 1e-20  # convert Å²/s → m²/s
+
+
+def _msd_exponent(msd_arr, time_s):
+    """Log-log slope α of MSD ∝ t^α over the fit window.
+
+    α ≈ 1 is diffusive (D is meaningful), α < 1 is caged/sub-diffusive,
+    α ≈ 2 is ballistic. If α is far from 1, the Einstein D is not converged.
+    """
+    lo, hi = _msd_fit_window(len(msd_arr))
+    lo = max(lo, 1)
+    t, m = time_s[lo:hi], msd_arr[lo:hi]
+    ok = (t > 0) & (m > 0)
+    if ok.sum() < 2:
+        return np.nan
+    return np.polyfit(np.log(t[ok]), np.log(m[ok]), 1)[0]
 
 
 def _velocities_from_positions(frames, dt_fs, log_interval=1):
@@ -154,7 +211,8 @@ def _get_velocities(frames, dt_fs, log_interval=1):
     pos_derived = _velocities_from_positions(frames, dt_fs, log_interval)
 
     try:
-        stored = np.array([f.get_velocities() for f in frames], dtype=float)
+        # ASE stores velocities in Å per ASE time unit (~10.18 fs); convert to Å/fs
+        stored = np.array([f.get_velocities() for f in frames], dtype=float) * units.fs
         if _stored_velocities_usable(stored, pos_derived):
             vels = stored
         else:
@@ -182,9 +240,18 @@ def _vacf_unnormalized(vels):
     return vacf
 
 
-def _calculate_vacf(frames, dt_fs, log_interval=1):
+def _select_velocities(frames, dt_fs, log_interval, vels, indices):
+    """Use precomputed velocities if given, then restrict to atom indices."""
+    if vels is None:
+        vels = _get_velocities(frames, dt_fs, log_interval)
+    if indices is not None:
+        vels = vels[:, indices]
+    return vels
+
+
+def _calculate_vacf(frames, dt_fs, log_interval=1, vels=None, indices=None):
     """Normalized VACF C(t)/C(0); lag axis in fs."""
-    vels = _get_velocities(frames, dt_fs, log_interval)
+    vels = _select_velocities(frames, dt_fs, log_interval, vels, indices)
     vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
         raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
@@ -200,10 +267,10 @@ def _vacf_integration_cutoff(vacf_norm):
     return max(2, 3 * len(vacf_norm) // 4)
 
 
-def _green_kubo_diffusion(frames, dt_fs, log_interval=1):
+def _green_kubo_diffusion(frames, dt_fs, log_interval=1, vels=None, indices=None):
     """Self-diffusion from Green–Kubo: D = (1/(3N)) ∫₀^t_c ⟨Σ_i v_i(0)·v_i(t)⟩ dt."""
-    vels = _get_velocities(frames, dt_fs, log_interval)
-    n_atoms = len(frames[0])
+    vels = _select_velocities(frames, dt_fs, log_interval, vels, indices)
+    n_atoms = vels.shape[1]
     vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
         raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
@@ -213,7 +280,7 @@ def _green_kubo_diffusion(frames, dt_fs, log_interval=1):
     vacf_norm = vacf / vacf[0]
     cutoff = _vacf_integration_cutoff(vacf_norm)
 
-    integral = np.trapz(vacf[:cutoff], lag_s[:cutoff])
+    integral = _trapezoid(vacf[:cutoff], lag_s[:cutoff])
     # VACF is in (Å/fs)², lag_s in s → integral in Å²·s/fs² → m²/s via ×1e10
     # (1 Å/fs)²·s = 10⁻²⁰ m² / (10⁻³⁰ s²) · s = 10¹⁰ m²/s
     return integral / (3.0 * n_atoms) * 1e10
@@ -239,9 +306,9 @@ def traj_dt_params(traj_path, cfg):
     return dt_fs, log_int
 
 
-def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
+def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1, vels=None, indices=None):
     """Phonon spectral function g(ω) = |∫ C(t) e^{-iωt} dt|² from windowed normalized VACF."""
-    vels = _get_velocities(frames, dt_fs, log_interval)
+    vels = _select_velocities(frames, dt_fs, log_interval, vels, indices)
     vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
         raise ValueError("VACF[0] == 0: all velocities appear to be zero.")
@@ -257,6 +324,130 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1):
 
     vdos_pmf = vdos_raw / np.sum(vdos_raw) if np.sum(vdos_raw) > 0 else vdos_raw
     return vdos_raw, vdos_pmf, freqs_thz
+
+
+# --- 2b. Element-resolved / peak utilities ---
+def _element_indices(frames):
+    """{element: atom indices} in order of first appearance."""
+    symbols = np.array(frames[0].get_chemical_symbols())
+    return {el: np.where(symbols == el)[0] for el in dict.fromkeys(symbols)}
+
+
+def _partial_rdf_pairs(cfg, elements):
+    """Pairs from cfg['partial_rdf_pairs'], else every element pair (incl. A–A)."""
+    custom = cfg.get("partial_rdf_pairs")
+    if custom:
+        pairs = [tuple(p) for p in custom]
+        missing = [p for p in pairs if p[0] not in elements or p[1] not in elements]
+        for p in missing:
+            print(f"  Skipping partial RDF {p[0]}-{p[1]}: element not in both trajectories.")
+        return [p for p in pairs if p not in missing]
+    return list(combinations_with_replacement(sorted(elements), 2))
+
+
+def _get_partial_rdfs(frames, pairs, rmax=6.0, bins=100):
+    """Partial g_ab(r) for each (a, b) pair, normalised so g_ab → 1 at large r.
+
+    Same ideal-gas normalisation as _get_distance_distribution:
+      a == b : N_a(N_a-1)/2 pairs     a != b : N_a·N_b pairs
+    Returns {pair: (g_r, raw_counts)}, r_centers.
+    """
+    idx = _element_indices(frames)
+    n_frames = len(frames)
+    volume = frames[0].get_volume()  # assumed constant (NVT)
+
+    bin_edges = np.linspace(0.1, rmax, bins + 1)
+    r_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    dr = bin_edges[1] - bin_edges[0]
+
+    hists = {pair: np.zeros(bins) for pair in pairs}
+    for frame in frames:
+        dists = frame.get_all_distances(mic=True)
+        for a, b in pairs:
+            ia, ib = idx[a], idx[b]
+            sub = dists[np.ix_(ia, ib)]
+            sub = sub[np.triu_indices(len(ia), k=1)] if a == b else sub.ravel()
+            hists[(a, b)] += np.histogram(sub, bins=bin_edges)[0]
+
+    out = {}
+    for a, b in pairs:
+        na, nb = len(idx[a]), len(idx[b])
+        n_pairs = na * (na - 1) / 2 if a == b else na * nb
+        ideal = n_frames * n_pairs * 4.0 * np.pi * r_centers**2 * dr / volume
+        with np.errstate(invalid='ignore', divide='ignore'):
+            g = np.where(ideal > 0, hists[(a, b)] / ideal, 0.0)
+        out[(a, b)] = (g, hists[(a, b)])
+    return out, r_centers
+
+
+def _first_peak(x, y, rel_prominence=0.1):
+    """(position, height) of the first prominent peak; falls back to the global max."""
+    if not np.any(y > 0):
+        return np.nan, np.nan
+    peaks, _ = find_peaks(y, prominence=rel_prominence * y.max())
+    k = peaks[0] if len(peaks) else int(np.argmax(y))
+    return x[k], y[k]
+
+
+def _rdf_emd(x, ref_g, pred_g):
+    """EMD (in units of x) between two g(r) curves treated as distributions."""
+    ref_w = ref_g / ref_g.sum() if ref_g.sum() > 0 else ref_g
+    pred_w = pred_g / pred_g.sum() if pred_g.sum() > 0 else pred_g
+    return wasserstein_distance(x, x, u_weights=ref_w, v_weights=pred_w)
+
+
+def _vacf_emd(ref_vacf, ref_lag, pred_vacf, pred_lag):
+    """EMD (fs) between |C(t)| envelopes, with pred interpolated onto the ref lag axis.
+
+    VACF goes negative (backscattering) and EMD needs non-negative weights.
+    """
+    if len(ref_lag) != len(pred_lag) or not np.allclose(ref_lag, pred_lag):
+        pred_vacf = np.interp(ref_lag, pred_lag, pred_vacf)
+    ref_abs, pred_abs = np.abs(ref_vacf), np.abs(pred_vacf)
+    ref_w = ref_abs / ref_abs.sum() if ref_abs.sum() > 0 else ref_abs
+    pred_w = pred_abs / pred_abs.sum() if pred_abs.sum() > 0 else pred_abs
+    return wasserstein_distance(ref_lag, ref_lag, u_weights=ref_w, v_weights=pred_w)
+
+
+def _vdos_emd(ref_freq, ref_pmf, pred_freq, pred_pmf):
+    """EMD (THz) on spectral shape (PMF), pred interpolated onto the ref frequency axis."""
+    if len(ref_freq) != len(pred_freq) or not np.allclose(ref_freq, pred_freq):
+        pred_pmf = np.interp(ref_freq, pred_freq, pred_pmf)
+        pred_pmf = pred_pmf / pred_pmf.sum()
+    return wasserstein_distance(ref_freq, ref_freq, u_weights=ref_pmf, v_weights=pred_pmf)
+
+
+def _vdos_peaks(freqs, spectrum, cfg):
+    """Peak frequencies (THz) of a VDOS, strongest `vdos_max_peaks`, sorted by frequency.
+
+    The spectrum is Gaussian-smoothed by `vdos_peak_smooth_thz` first, since
+    short trajectories give noisy spectra. Peaks must exceed
+    `vdos_peak_prominence` × the maximum and lie below `vdos_peak_fmax_thz`.
+    """
+    df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
+    sigma = cfg.get("vdos_peak_smooth_thz", 0.5) / df
+    y = gaussian_filter1d(spectrum, sigma) if sigma > 0 else spectrum
+    mask = freqs <= cfg.get("vdos_peak_fmax_thz", 100.0)
+    y = np.where(mask, y, 0.0)
+    if y.max() <= 0:
+        return np.array([])
+    peaks, props = find_peaks(y, prominence=cfg.get("vdos_peak_prominence", 0.05) * y.max())
+    top = peaks[np.argsort(props["prominences"])[::-1][:cfg.get("vdos_max_peaks", 10)]]
+    return np.sort(freqs[top])
+
+
+def _match_peaks(ref_peaks, pred_peaks, tol_thz):
+    """For each reference peak, the shift to the nearest predicted peak."""
+    if len(ref_peaks) == 0:
+        return {"shift_mean_THz": np.nan, "shift_max_THz": np.nan, "frac_matched": np.nan}
+    if len(pred_peaks) == 0:
+        return {"shift_mean_THz": np.nan, "shift_max_THz": np.nan, "frac_matched": 0.0}
+    shifts = np.array([np.min(np.abs(pred_peaks - p)) for p in ref_peaks])
+    return {
+        "shift_mean_THz": float(shifts.mean()),
+        "shift_max_THz": float(shifts.max()),
+        "frac_matched": float(np.mean(shifts <= tol_thz)),
+    }
 
 
 KB_EV_K = 8.617333262145e-5
@@ -399,6 +590,140 @@ def _get_kinetic_energy(frame, temp_k=None):
     if temp_ke is not None:
         return temp_ke
     return 0.0
+
+
+def _get_stress(frame):
+    """Voigt stress (eV/Å³) stored on a frame, or None if the reference has none."""
+    try:
+        return np.asarray(frame.get_stress(voigt=True), dtype=float)
+    except Exception:
+        pass
+    if "stress" in frame.info:
+        s = np.asarray(frame.info["stress"], dtype=float)
+        if s.shape == (3, 3):
+            s = np.array([s[0, 0], s[1, 1], s[2, 2], s[1, 2], s[0, 2], s[0, 1]])
+        return s
+    return None
+
+
+def snapshot_traj_paths(cfg):
+    """Reference / MLIP single-point trajectories written by run_snapshot_errors."""
+    base = str(cfg.get("validation_output_csv", "validation_results.csv")).replace(".csv", "")
+    return Path(f"{base}_SNAPSHOT_REF.traj"), Path(f"{base}_SNAPSHOT_MLIP.traj")
+
+
+def _snapshot_errors(frames, cfg):
+    """MLIP single points on reference (AIMD) frames vs. the stored DFT labels.
+
+    Unlike the distribution metrics, this compares energies/forces on the
+    *same* configurations, so it isolates potential error from sampling.
+    Writes paired single-point trajectories for the parity plots.
+    """
+    from ase import units
+    from ase.io import write
+    from ase.calculators.singlepoint import SinglePointCalculator
+    from md_sim.md_tools import make_calculator
+
+    calc = make_calculator(
+        cfg.get("model_type", "mace"), cfg.get("model_variant", "large"),
+        cfg.get("device", "cpu"), cfg.get("head"))
+
+    e_ref, e_pred, f_ref, f_pred, s_ref, s_pred = [], [], [], [], [], []
+    ref_out, mlip_out = [], []
+    for k, frame in enumerate(frames):
+        er = _get_potential_energy(frame)
+        fr = _get_forces(frame)
+        sr = _get_stress(frame)
+
+        atoms = frame.copy()
+        atoms.calc = calc
+        ep = atoms.get_potential_energy()
+        fp = atoms.get_forces()
+        sp = None
+        if sr is not None:
+            try:
+                sp = atoms.get_stress(voigt=True)
+            except Exception:
+                sp = None
+
+        e_ref.append(er)
+        e_pred.append(ep)
+        f_ref.append(fr)
+        f_pred.append(fp)
+        if sr is not None and sp is not None:
+            s_ref.append(sr)
+            s_pred.append(sp)
+
+        for out, e, f, s in ((ref_out, er, fr, sr), (mlip_out, ep, fp, sp)):
+            a = frame.copy()
+            results = {"energy": e, "forces": f}
+            if s is not None:
+                results["stress"] = s
+            a.calc = SinglePointCalculator(a, **results)
+            out.append(a)
+
+        if (k + 1) % 10 == 0 or k + 1 == len(frames):
+            print(f"  Snapshot single points: {k + 1}/{len(frames)}")
+
+    ref_path, mlip_path = snapshot_traj_paths(cfg)
+    write(ref_path, ref_out)
+    write(mlip_path, mlip_out)
+    print(f"  Saved paired snapshots to {ref_path} and {mlip_path}")
+
+    n_atoms = len(frames[0])
+    symbols = np.array(frames[0].get_chemical_symbols())
+    e_ref = np.array(e_ref) / n_atoms
+    e_pred = np.array(e_pred) / n_atoms
+    f_ref = np.array(f_ref)
+    f_pred = np.array(f_pred)
+
+    res = {"Snap_n_frames": len(frames)}
+
+    # Energies: a constant offset (different DFT settings / references) is
+    # reported separately from the configuration-dependent error.
+    de = e_pred - e_ref
+    offset = de.mean()
+    res["Snap_E_MAE_meV_atom"] = np.mean(np.abs(de)) * 1000
+    res["Snap_E_RMSE_meV_atom"] = np.sqrt(np.mean(de**2)) * 1000
+    res["Snap_E_offset_meV_atom"] = offset * 1000
+    res["Snap_E_MAE_offset_removed_meV_atom"] = np.mean(np.abs(de - offset)) * 1000
+
+    # Forces (per Cartesian component)
+    df = f_pred - f_ref
+    rmse = np.sqrt(np.mean(df**2))
+    res["Snap_F_MAE_eV_A"] = np.mean(np.abs(df))
+    res["Snap_F_RMSE_eV_A"] = rmse
+    res["Snap_F_relative_RMSE"] = rmse / np.sqrt(np.mean(f_ref**2))
+    # Slope of pred vs ref forces through the origin; < 1 means the MLIP PES is
+    # too soft (systematic softening), which speeds up diffusion
+    res["Snap_F_parity_slope"] = np.sum(f_ref * f_pred) / np.sum(f_ref**2)
+
+    # Force direction agreement, ignoring near-zero reference forces
+    nr = np.linalg.norm(f_ref, axis=2)
+    npred = np.linalg.norm(f_pred, axis=2)
+    ok = (nr > 0.1) & (npred > 0)
+    if ok.any():
+        cos = np.sum(f_ref * f_pred, axis=2)[ok] / (nr[ok] * npred[ok])
+        res["Snap_F_mean_cosine"] = float(np.mean(cos))
+
+    for el in dict.fromkeys(symbols):
+        d = df[:, symbols == el]
+        res[f"Snap_F_MAE_{el}_eV_A"] = np.mean(np.abs(d))
+        res[f"Snap_F_RMSE_{el}_eV_A"] = np.sqrt(np.mean(d**2))
+        fr_el, fp_el = f_ref[:, symbols == el], f_pred[:, symbols == el]
+        res[f"Snap_F_parity_slope_{el}"] = np.sum(fr_el * fp_el) / np.sum(fr_el**2)
+
+    # Stress, only if the reference frames carry it
+    if s_ref:
+        ds = (np.array(s_pred) - np.array(s_ref)) / units.GPa
+        res["Snap_Stress_MAE_GPa"] = np.mean(np.abs(ds))
+        res["Snap_Pressure_MAE_GPa"] = np.mean(np.abs(ds[:, :3].mean(axis=1)))
+
+    raw = {
+        "Snap_E_ref_eV_atom": e_ref,
+        "Snap_E_pred_eV_atom": e_pred,
+    }
+    return res, raw
 
 
 _KIN_CSV_DEFAULTS = (
@@ -619,19 +944,38 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_Force_Mag_eV_A"] = ref_f_mag
         raw_data["Pred_Force_Mag_eV_A"] = pred_f_mag
 
+    # 3b. Single-point errors on reference frames (same configurations, not distributions)
+    if cfg.get("run_snapshot_errors", False):
+        print("Snapshot errors: MLIP single points on reference frames...")
+        try:
+            snap_frames = ref_frames[::max(1, int(cfg.get("snapshot_stride", 10)))]
+            max_frames = cfg.get("snapshot_max_frames")
+            if max_frames:
+                snap_frames = snap_frames[:int(max_frames)]
+            snap_res, snap_raw = _snapshot_errors(snap_frames, cfg)
+            res.update(snap_res)
+            raw_data.update(snap_raw)
+        except Exception as e:
+            print(f"Warning: Could not compute snapshot errors: {e}")
+
+    # Structural metrics can use every Nth frame (distance matrices are O(N²) per frame)
+    stride = max(1, int(cfg.get("structure_frame_stride", 1)))
+    ref_struct, pred_struct = ref_frames[::stride], pred_frames[::stride]
+
+    # Elements present in both trajectories (for element-resolved metrics)
+    ref_el = _element_indices(ref_frames)
+    pred_el = _element_indices(pred_frames)
+    elements = [el for el in ref_el if el in pred_el]
+
     # 4. RDF (Radial Distribution Function)
     if cfg.get("run_rdf", True):
-        ref_rdf_g, ref_rdf_raw, x_rdf = _get_distance_distribution(ref_frames)
-        pred_rdf_g, pred_rdf_raw, _ = _get_distance_distribution(pred_frames)
+        ref_rdf_g, ref_rdf_raw, x_rdf = _get_distance_distribution(ref_struct)
+        pred_rdf_g, pred_rdf_raw, _ = _get_distance_distribution(pred_struct)
 
         # Normalise g(r) to a PMF to use as weights for the Wasserstein distance.
         # The result has units of Angstroms: the average distance probability mass
         # must be transported to transform the reference g(r) into the predicted one.
-        ref_rdf_pmf = ref_rdf_g / np.sum(ref_rdf_g) if np.sum(ref_rdf_g) > 0 else ref_rdf_g
-        pred_rdf_pmf = pred_rdf_g / np.sum(pred_rdf_g) if np.sum(pred_rdf_g) > 0 else pred_rdf_g
-        res["EMD_RDF_Angstrom"] = wasserstein_distance(
-            x_rdf, x_rdf, u_weights=ref_rdf_pmf, v_weights=pred_rdf_pmf
-        )
+        res["EMD_RDF_Angstrom"] = _rdf_emd(x_rdf, ref_rdf_g, pred_rdf_g)
 
         raw_data["RDF_Distance_Angstrom"] = x_rdf
         raw_data["RDF_Ref_Raw_Counts"] = ref_rdf_raw
@@ -639,10 +983,36 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["RDF_Ref_g_r"] = ref_rdf_g
         raw_data["RDF_Pred_g_r"] = pred_rdf_g
 
+    # 4b. Partial RDFs g_ab(r) for every element pair (or cfg['partial_rdf_pairs'])
+    if cfg.get("run_partial_rdf", False):
+        pairs = _partial_rdf_pairs(cfg, elements)
+        rmax = cfg.get("partial_rdf_rmax", 6.0)
+        bins = cfg.get("partial_rdf_bins", 100)
+        ref_prdf, x_prdf = _get_partial_rdfs(ref_struct, pairs, rmax=rmax, bins=bins)
+        pred_prdf, _ = _get_partial_rdfs(pred_struct, pairs, rmax=rmax, bins=bins)
+
+        raw_data["pRDF_Distance_Angstrom"] = x_prdf
+        for a, b in pairs:
+            label = f"{a}-{b}"
+            ref_g, pred_g = ref_prdf[(a, b)][0], pred_prdf[(a, b)][0]
+            res[f"EMD_pRDF_{label}_Angstrom"] = _rdf_emd(x_prdf, ref_g, pred_g)
+
+            # First-shell peak: the most physically interpretable number (e.g. B–H bond)
+            r_ref, h_ref = _first_peak(x_prdf, ref_g)
+            r_pred, h_pred = _first_peak(x_prdf, pred_g)
+            res[f"pRDF_{label}_peak1_ref_A"] = r_ref
+            res[f"pRDF_{label}_peak1_pred_A"] = r_pred
+            res[f"pRDF_{label}_peak1_shift_A"] = abs(r_pred - r_ref)
+            res[f"pRDF_{label}_peak1_height_ref"] = h_ref
+            res[f"pRDF_{label}_peak1_height_pred"] = h_pred
+
+            raw_data[f"pRDF_{label}_Ref_g_r"] = ref_g
+            raw_data[f"pRDF_{label}_Pred_g_r"] = pred_g
+
     # 5. ADF (Angular Distribution Function)
     if cfg.get("run_adf", True):
-        ref_adf_norm, ref_adf_raw, x_adf = _get_angle_distribution(ref_frames)
-        pred_adf_norm, pred_adf_raw, _ = _get_angle_distribution(pred_frames)
+        ref_adf_norm, ref_adf_raw, x_adf = _get_angle_distribution(ref_struct)
+        pred_adf_norm, pred_adf_raw, _ = _get_angle_distribution(pred_struct)
 
         # EMD with bin-centre positions as the 1D support.
         # Result has units of degrees.
@@ -665,129 +1035,172 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Ref_Total_Epot_eV"] = ref_epot_total
         raw_data["Pred_Total_Epot_eV"] = pred_epot_total
 
+    # Frame spacing: AIMD may be logged at a different dt / interval than the MLIP run
     log_int = cfg.get("log_interval", 1)
+    aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
+    ref_dt_frame_s = aimd_dt_fs * aimd_log_interval * 1e-15
+    pred_dt_frame_s = dt_fs * log_int * 1e-15
+
+    # Velocities are computed once per trajectory and reused by GK / VACF / VDOS
+    _vel_cache = {}
+
+    def ref_vels():
+        if "ref" not in _vel_cache:
+            _vel_cache["ref"] = _get_velocities(ref_frames, aimd_dt_fs, aimd_log_interval)
+        return _vel_cache["ref"]
+
+    def pred_vels():
+        if "pred" not in _vel_cache:
+            _vel_cache["pred"] = _get_velocities(pred_frames, dt_fs, log_int)
+        return _vel_cache["pred"]
 
     # 7. Diffusion Coefficient from MSD (Einstein relation: MSD = 6*D*t)
+    if cfg.get("run_msd", True) or cfg.get("run_element_msd", False):
+        ref_pos = _com_free_positions(ref_frames)
+        pred_pos = _com_free_positions(pred_frames)
+        ref_time_s = np.arange(len(ref_frames)) * ref_dt_frame_s
+        pred_time_s = np.arange(len(pred_frames)) * pred_dt_frame_s
+        raw_data["MSD_Time_ps"] = ref_time_s * 1e12
+        raw_data["Pred_MSD_Time_ps"] = pred_time_s * 1e12
+
     if cfg.get("run_msd", True):
-        aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
-        ref_dt_frame_s = aimd_dt_fs * aimd_log_interval * 1e-15
-        pred_dt_frame_s = dt_fs * log_int * 1e-15
+        ref_msd_arr = _msd_from_positions(ref_pos)
+        pred_msd_arr = _msd_from_positions(pred_pos)
 
-        ref_msd_arr = _calculate_msd(ref_frames)
-        pred_msd_arr = _calculate_msd(pred_frames)
-
-        ref_time_s = np.arange(len(ref_msd_arr)) * ref_dt_frame_s
-        pred_time_s = np.arange(len(pred_msd_arr)) * pred_dt_frame_s
-
-        def _diffusion_coeff(msd_arr, time_s):
-            """Fit MSD[25%:75%] vs t to extract D = slope/6 in m²/s.
-
-            The first quarter is dominated by ballistic/vibrational motion;
-            the last quarter has high statistical noise (few time-origin pairs).
-            Fitting the middle 25–75% of the trajectory is the standard
-            literature approach for extracting D from MD.
-            """
-            n = len(msd_arr)
-            lo, hi = n // 4, 3 * n // 4
-            if hi - lo < 2:
-                # Trajectory too short for a reliable fit; fall back to endpoint
-                return msd_arr[-1] / (6.0 * time_s[-1]) * 1e-20 if time_s[-1] > 0 else 0.0
-            slope = np.polyfit(time_s[lo:hi], msd_arr[lo:hi], 1)[0]  # Å²/s
-            return slope / 6.0 * 1e-20  # convert Å²/s → m²/s
-
-        D_ref = _diffusion_coeff(ref_msd_arr, ref_time_s)
-        D_pred = _diffusion_coeff(pred_msd_arr, pred_time_s)
+        D_ref = _msd_diffusion_coeff(ref_msd_arr, ref_time_s)
+        D_pred = _msd_diffusion_coeff(pred_msd_arr, pred_time_s)
 
         res["D_ref_m2_s"] = D_ref
         res["D_pred_m2_s"] = D_pred
         res["D_Error_m2_s"] = abs(D_ref - D_pred)
+        # α ≈ 1 means the fit window is diffusive; otherwise D is not converged
+        res["MSD_alpha_ref"] = _msd_exponent(ref_msd_arr, ref_time_s)
+        res["MSD_alpha_pred"] = _msd_exponent(pred_msd_arr, pred_time_s)
 
-        # Keep MSD time-axis in ps for human-readable CSV (reference trajectory axis)
-        raw_data["MSD_Time_ps"] = ref_time_s * 1e12
         raw_data["Ref_MSD_vs_Time_A2"] = ref_msd_arr
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
+
+    # 7a. Element-resolved MSD diffusion (+ Green–Kubo if run_green_kubo)
+    if cfg.get("run_element_msd", False):
+        for el in elements:
+            ref_msd_el = _msd_from_positions(ref_pos[:, ref_el[el]])
+            pred_msd_el = _msd_from_positions(pred_pos[:, pred_el[el]])
+            D_ref_el = _msd_diffusion_coeff(ref_msd_el, ref_time_s)
+            D_pred_el = _msd_diffusion_coeff(pred_msd_el, pred_time_s)
+
+            res[f"D_ref_{el}_m2_s"] = D_ref_el
+            res[f"D_pred_{el}_m2_s"] = D_pred_el
+            res[f"D_Error_{el}_m2_s"] = abs(D_ref_el - D_pred_el)
+            res[f"MSD_alpha_ref_{el}"] = _msd_exponent(ref_msd_el, ref_time_s)
+            res[f"MSD_alpha_pred_{el}"] = _msd_exponent(pred_msd_el, pred_time_s)
+
+            raw_data[f"Ref_MSD_{el}_A2"] = ref_msd_el
+            raw_data[f"Pred_MSD_{el}_A2"] = pred_msd_el
 
     # 7b. Diffusion coefficient — Green–Kubo (VACF integral)
     if cfg.get("run_green_kubo", True):
         try:
-            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
             D_ref_gk = _green_kubo_diffusion(
-                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+                ref_frames, aimd_dt_fs, aimd_log_interval, vels=ref_vels())
             D_pred_gk = _green_kubo_diffusion(
-                pred_frames, dt_fs, log_interval=log_int)
+                pred_frames, dt_fs, log_int, vels=pred_vels())
 
             res["D_ref_GK_m2_s"] = D_ref_gk
             res["D_pred_GK_m2_s"] = D_pred_gk
             res["D_GK_Error_m2_s"] = abs(D_ref_gk - D_pred_gk)
+
+            if cfg.get("run_element_msd", False):
+                for el in elements:
+                    D_ref_el = _green_kubo_diffusion(
+                        ref_frames, aimd_dt_fs, aimd_log_interval,
+                        vels=ref_vels(), indices=ref_el[el])
+                    D_pred_el = _green_kubo_diffusion(
+                        pred_frames, dt_fs, log_int,
+                        vels=pred_vels(), indices=pred_el[el])
+                    res[f"D_ref_GK_{el}_m2_s"] = D_ref_el
+                    res[f"D_pred_GK_{el}_m2_s"] = D_pred_el
+                    res[f"D_GK_Error_{el}_m2_s"] = abs(D_ref_el - D_pred_el)
         except Exception as e:
             print(f"Warning: Could not compute Green–Kubo diffusion: {e}")
 
-    # 8. Velocity Autocorrelation Function (VACF)
+    # 8. Velocity Autocorrelation Function (VACF), total and per element
+    vacf_targets = []
     if cfg.get("run_vacf", False):
+        vacf_targets.append(("", None, None))
+    if cfg.get("run_element_vacf", False):
+        vacf_targets += [(f"_{el}", ref_el[el], pred_el[el]) for el in elements]
+
+    for suffix, ref_idx, pred_idx in vacf_targets:
         try:
-            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
-
             ref_vacf, ref_vacf_lag = _calculate_vacf(
-                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+                ref_frames, aimd_dt_fs, aimd_log_interval, vels=ref_vels(), indices=ref_idx)
             pred_vacf, pred_vacf_lag = _calculate_vacf(
-                pred_frames, dt_fs, log_interval=log_int)
+                pred_frames, dt_fs, log_int, vels=pred_vels(), indices=pred_idx)
 
-            if len(ref_vacf) != len(pred_vacf):
-                pred_vacf_interp = np.interp(ref_vacf_lag, pred_vacf_lag, pred_vacf)
-            else:
-                pred_vacf_interp = pred_vacf
+            res[f"EMD_VACF{suffix}_fs"] = _vacf_emd(
+                ref_vacf, ref_vacf_lag, pred_vacf, pred_vacf_lag)
 
-            ref_w = ref_vacf / ref_vacf.sum() if ref_vacf.sum() > 0 else ref_vacf
-            pred_w = pred_vacf_interp / pred_vacf_interp.sum() if pred_vacf_interp.sum() > 0 else pred_vacf_interp
-            res["EMD_VACF_fs"] = wasserstein_distance(
-                ref_vacf_lag, ref_vacf_lag, u_weights=ref_w, v_weights=pred_w
-            )
-
-            raw_data["Ref_VACF_Lag_fs"] = ref_vacf_lag
-            raw_data["Ref_VACF"] = ref_vacf
-            raw_data["Pred_VACF_Lag_fs"] = pred_vacf_lag
-            raw_data["Pred_VACF"] = pred_vacf
+            raw_data[f"Ref_VACF{suffix}_Lag_fs"] = ref_vacf_lag
+            raw_data[f"Ref_VACF{suffix}"] = ref_vacf
+            raw_data[f"Pred_VACF{suffix}_Lag_fs"] = pred_vacf_lag
+            raw_data[f"Pred_VACF{suffix}"] = pred_vacf
         except Exception as e:
-            print(f"Warning: Could not compute VACF: {e}")
+            print(f"Warning: Could not compute VACF{suffix}: {e}")
 
-    # 9. Vibrational Density of States (VDOS)
-    if cfg.get("run_vdos", False):
+    # 9. Vibrational Density of States (VDOS), total and per element, + peak analysis
+    run_peaks = cfg.get("run_vdos_peaks", False)
+    vdos_targets = []
+    if cfg.get("run_vdos", False) or run_peaks:
+        vdos_targets.append(("", None, None))
+    if cfg.get("run_element_vdos", False):
+        vdos_targets += [(f"_{el}", ref_el[el], pred_el[el]) for el in elements]
+
+    if vdos_targets:
+        # Frequency resolution is 1 / (trajectory length): short runs cannot resolve close peaks
+        res["VDOS_resolution_ref_THz"] = 1e-12 / (len(ref_frames) * ref_dt_frame_s)
+        res["VDOS_resolution_pred_THz"] = 1e-12 / (len(pred_frames) * pred_dt_frame_s)
+        peak_tol = cfg.get("vdos_peak_tol_thz") or 2.0 * max(
+            res["VDOS_resolution_ref_THz"], res["VDOS_resolution_pred_THz"])
+
+    for suffix, ref_idx, pred_idx in vdos_targets:
         try:
             # AIMD and MACE trajectories can have different timesteps and output
-            # intervals.  Use aimd_dt_fs / aimd_log_interval for the reference if
-            # provided; fall back to the MACE values if not.
-            aimd_dt_fs, aimd_log_interval = _aimd_dt_params(cfg, dt_fs, log_int)
-
+            # intervals; aimd_dt_fs / aimd_log_interval handle the reference.
             ref_vdos, ref_vdos_pmf, ref_vdos_freq = _calculate_vdos_spectrum(
-                ref_frames, aimd_dt_fs, log_interval=aimd_log_interval)
+                ref_frames, aimd_dt_fs, aimd_log_interval, vels=ref_vels(), indices=ref_idx)
             pred_vdos, pred_vdos_pmf, pred_vdos_freq = _calculate_vdos_spectrum(
-                pred_frames, dt_fs, log_interval=log_int)
+                pred_frames, dt_fs, log_int, vels=pred_vels(), indices=pred_idx)
 
             # EMD on spectral shape (PMF), not on raw g(ω) amplitudes.
-            if len(ref_vdos_pmf) != len(pred_vdos_pmf):
-                pred_pmf_interp = np.interp(ref_vdos_freq, pred_vdos_freq, pred_vdos_pmf)
-                pred_pmf_interp /= pred_pmf_interp.sum()
-            else:
-                pred_pmf_interp = pred_vdos_pmf
+            if cfg.get("run_vdos", False) or suffix:
+                res[f"EMD_VDOS{suffix}_THz"] = _vdos_emd(
+                    ref_vdos_freq, ref_vdos_pmf, pred_vdos_freq, pred_vdos_pmf)
 
-            res["EMD_VDOS_THz"] = wasserstein_distance(
-                ref_vdos_freq, ref_vdos_freq,
-                u_weights=ref_vdos_pmf, v_weights=pred_pmf_interp
-            )
+            if run_peaks:
+                ref_peaks = _vdos_peaks(ref_vdos_freq, ref_vdos_pmf, cfg)
+                pred_peaks = _vdos_peaks(pred_vdos_freq, pred_vdos_pmf, cfg)
+                match = _match_peaks(ref_peaks, pred_peaks, peak_tol)
+                res[f"VDOS{suffix}_n_peaks_ref"] = len(ref_peaks)
+                res[f"VDOS{suffix}_n_peaks_pred"] = len(pred_peaks)
+                res[f"VDOS{suffix}_peak_shift_mean_THz"] = match["shift_mean_THz"]
+                res[f"VDOS{suffix}_peak_shift_max_THz"] = match["shift_max_THz"]
+                res[f"VDOS{suffix}_frac_peaks_matched"] = match["frac_matched"]
+                raw_data[f"Ref_VDOS{suffix}_Peaks_THz"] = ref_peaks
+                raw_data[f"Pred_VDOS{suffix}_Peaks_THz"] = pred_peaks
 
-            raw_data["Ref_VDOS_Freq_THz"] = ref_vdos_freq
-            raw_data["Ref_VDOS_g_omega"] = ref_vdos
-            raw_data["Ref_VDOS_Shape_PMF"] = ref_vdos_pmf
-            raw_data["Pred_VDOS_Freq_THz"] = pred_vdos_freq
-            raw_data["Pred_VDOS_g_omega"] = pred_vdos
-            raw_data["Pred_VDOS_Shape_PMF"] = pred_vdos_pmf
+            raw_data[f"Ref_VDOS{suffix}_Freq_THz"] = ref_vdos_freq
+            raw_data[f"Ref_VDOS{suffix}_g_omega"] = ref_vdos
+            raw_data[f"Ref_VDOS{suffix}_Shape_PMF"] = ref_vdos_pmf
+            raw_data[f"Pred_VDOS{suffix}_Freq_THz"] = pred_vdos_freq
+            raw_data[f"Pred_VDOS{suffix}_g_omega"] = pred_vdos
+            raw_data[f"Pred_VDOS{suffix}_Shape_PMF"] = pred_vdos_pmf
         except Exception as e:
-            print(f"Warning: Could not compute VDOS: {e}")
+            print(f"Warning: Could not compute VDOS{suffix}: {e}")
 
     # Print Scalar Results
     print("\n--- Validation Results ---")
     for k, v in res.items():
-        print(f"{k:30s}: {v:.6f}")
+        print(f"{k:30s}: {v:.6g}")
         
     # --- EXPORT RAW DATA TO CSV ---
     if raw_data:

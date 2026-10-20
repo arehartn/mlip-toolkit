@@ -39,11 +39,24 @@ BOOLEAN_KEYS = frozenset({
     "plot_vdos_overlay",
     "plot_parity",
     "plot_thermo",
+    "run_partial_rdf",
+    "run_snapshot_errors",
+    "run_element_msd",
+    "run_element_vacf",
+    "run_element_vdos",
+    "run_vdos_peaks",
+    "run_relax_energy",
+    "run_lattice",
+    "run_position_rmsd",
+    "run_bond_lengths",
+    "run_space_group",
+    "run_phonon_dos",
 })
 
 DEFAULT_CONFIG_NAMES = {
     "simulation": "simulation.json",
     "relaxation": "relaxation.json",
+    "static": "static.json",
 }
 
 
@@ -80,7 +93,7 @@ def load_config(
     Load settings from a JSON file.
 
     If config_path is None, uses the bundled default for ``profile``
-    (``"simulation"`` or ``"relaxation"``).
+    (``"simulation"``, ``"relaxation"`` or ``"static"``).
     """
     path = Path(config_path) if config_path is not None else default_config_path(profile)
     if not path.is_file():

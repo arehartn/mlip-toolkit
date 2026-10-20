@@ -49,6 +49,27 @@
   "run_green_kubo": true,
   "run_vacf": false,
   "run_vdos": false,
+
+  "run_snapshot_errors": false,
+  "snapshot_stride": 10,
+  "snapshot_max_frames": null,
+
+  "structure_frame_stride": 1,
+  "run_partial_rdf": false,
+  "partial_rdf_pairs": null,
+  "partial_rdf_rmax": 6.0,
+  "partial_rdf_bins": 100,
+
+  "run_element_msd": false,
+  "run_element_vacf": false,
+  "run_element_vdos": false,
+
+  "run_vdos_peaks": false,
+  "vdos_peak_smooth_thz": 0.5,
+  "vdos_peak_prominence": 0.05,
+  "vdos_peak_fmax_thz": 100.0,
+  "vdos_max_peaks": 10,
+  "vdos_peak_tol_thz": null,
   "aimd_dt_fs": null,
   "aimd_log_interval": null,
 

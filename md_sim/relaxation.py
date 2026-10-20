@@ -24,6 +24,25 @@ def _resolve_config(config=None, config_path=None, config_overrides=None):
     return cfg
 
 
+def relax_atoms(atoms, fmax=0.01, max_steps=500, relax_cell=False,
+                optimizer="lbfgs", trajectory=None, logfile=None):
+    """Relax ``atoms`` in place with its attached calculator. Returns True if converged."""
+    opt_target = FrechetCellFilter(atoms) if relax_cell else atoms
+
+    opt_kwargs = {}
+    if trajectory is not None:
+        opt_kwargs["trajectory"] = trajectory
+    if logfile is not None:
+        opt_kwargs["logfile"] = logfile
+
+    if optimizer.lower() == "precon_lbfgs":
+        opt = PreconLBFGS(opt_target, **opt_kwargs)
+    else:
+        opt = LBFGS(opt_target, **opt_kwargs)
+
+    return bool(opt.run(fmax=fmax, steps=max_steps))
+
+
 def run(config=None, config_path=None, config_overrides=None):
     cfg = _resolve_config(config, config_path, config_overrides)
 
@@ -50,22 +69,14 @@ def run(config=None, config_path=None, config_overrides=None):
     max_steps = cfg.get("max_steps", 500)
     optimizer = cfg.get("optimizer", "lbfgs").lower()
 
-    opt_target = FrechetCellFilter(atoms) if relax_cell else atoms
-
-    opt_kwargs = {}
-    if cfg.get("write_trajectory", True):
-        opt_kwargs["trajectory"] = f"{out_prefix}.traj"
-    if cfg.get("write_log", True):
-        opt_kwargs["logfile"] = f"{out_prefix}.log"
-
-    if optimizer == "precon_lbfgs":
-        opt = PreconLBFGS(opt_target, **opt_kwargs)
-    else:
-        opt = LBFGS(opt_target, **opt_kwargs)
-
     print(f"Optimizer: {optimizer} | fmax: {fmax} eV/Å | max_steps: {max_steps}"
           f" | relax_cell: {relax_cell}")
-    opt.run(fmax=fmax, steps=max_steps)
+    relax_atoms(
+        atoms, fmax=fmax, max_steps=max_steps, relax_cell=relax_cell,
+        optimizer=optimizer,
+        trajectory=f"{out_prefix}.traj" if cfg.get("write_trajectory", True) else None,
+        logfile=f"{out_prefix}.log" if cfg.get("write_log", True) else None,
+    )
 
     atomic_fmax = float(np.abs(atoms.get_forces()).max())
     print(f"Final max atomic force: {atomic_fmax:.4f} eV/Å")
