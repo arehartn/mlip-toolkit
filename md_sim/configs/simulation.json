@@ -50,7 +50,7 @@
   "run_vacf": false,
   "run_vdos": false,
 
-  "run_snapshot_errors": false,
+  "run_snapshot_errors": true,
   "snapshot_stride": 10,
   "snapshot_max_frames": null,
 
@@ -59,6 +59,15 @@
   "partial_rdf_pairs": null,
   "partial_rdf_rmax": 6.0,
   "partial_rdf_bins": 100,
+  "run_partial_adf": false,
+  "partial_adf_triplets": null,
+  "partial_adf_rcut": 1.5,
+  "partial_adf_bins": 90,
+
+  "diffusion_elements": null,
+  "gk_max_lag_frac": 0.5,
+  "gk_plateau_frac": 0.5,
+  "vacf_compare_max_fs": null,
 
   "run_element_msd": false,
   "run_element_vacf": false,

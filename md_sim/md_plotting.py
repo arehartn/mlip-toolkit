@@ -14,6 +14,8 @@ try:
         _get_angle_distribution,
         _calculate_vacf,
         _calculate_vdos_spectrum,
+        _get_partial_rdfs,
+        _get_triplet_angle_distribution,
         traj_dt_params,
         snapshot_traj_paths,
     )
@@ -24,15 +26,11 @@ except ImportError:
         _get_angle_distribution,
         _calculate_vacf,
         _calculate_vdos_spectrum,
+        _get_partial_rdfs,
+        _get_triplet_angle_distribution,
         traj_dt_params,
         snapshot_traj_paths,
     )
-
-try:
-    from sklearn.metrics import mean_absolute_error
-except ImportError:
-    def mean_absolute_error(y_true, y_pred):
-        return np.mean(np.abs(np.array(y_true) - np.array(y_pred)))
 
 # --- Robust Column Searching ---
 def get_col(df, custom_list, default_list):
@@ -74,6 +72,7 @@ def generate_plots(cfg):
     if cfg.get("plot_structural_overlays", True) and trajs_to_plot:
         _plot_structural_overlay(trajs_to_plot, out_dir / "rdf_overlay.png", mode="RDF", burn_in=burn_in, cfg=cfg)
         _plot_structural_overlay(trajs_to_plot, out_dir / "adf_overlay.png", mode="ADF", burn_in=burn_in, cfg=cfg)
+        _plot_partial_overlays(trajs_to_plot, out_dir, burn_in=burn_in, cfg=cfg)
 
     if cfg.get("plot_parity", True):
         snap_ref, snap_mlip = snapshot_traj_paths(cfg)
@@ -203,6 +202,77 @@ def _plot_structural_overlay(traj_dict, save_path, mode="RDF", burn_in=800, cfg=
     plt.close()
 
 
+def _plot_partial_overlays(traj_dict, out_dir, burn_in=800, cfg=None):
+    """Partial RDFs (cfg['partial_rdf_pairs']) and triplet ADFs (cfg['partial_adf_triplets'])."""
+    if cfg is None:
+        cfg = {}
+    pairs = [tuple(p) for p in cfg.get("partial_rdf_pairs") or []]
+    triplets = [tuple(t) for t in cfg.get("partial_adf_triplets") or []]
+    if not pairs and not triplets:
+        return
+
+    lw = cfg.get("plot_style", {}).get("line_width", 2)
+    rmax = cfg.get("partial_rdf_rmax", 6.0)
+    rdf_bins = cfg.get("partial_rdf_bins", 100)
+    adf_bins = cfg.get("partial_adf_bins", 90)
+    default_rcut = cfg.get("partial_adf_rcut", 1.5)
+
+    panels = [("RDF", p) for p in pairs] + [("ADF", t) for t in triplets]
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4.5), squeeze=False)
+    axes = axes[0]
+
+    for label, path in traj_dict.items():
+        print(f"Calculating partial RDF/ADF plots for {label}...")
+        try:
+            full_traj = read(str(path), index=":")
+            actual_burn = burn_in if burn_in < len(full_traj) else max(0, len(full_traj) // 2)
+            frames = full_traj[actual_burn::10]
+            if not frames:
+                continue
+            symbols = set(frames[0].get_chemical_symbols())
+            is_ref = "Reference" in label or "AIMD" in label
+
+            valid_pairs = [p for p in pairs if set(p) <= symbols]
+            prdf, r = _get_partial_rdfs(frames, valid_pairs, rmax=rmax, bins=rdf_bins) if valid_pairs else ({}, None)
+
+            for ax, (kind, spec) in zip(axes, panels):
+                if kind == "RDF":
+                    if spec not in prdf:
+                        continue
+                    x, y = r, prdf[spec][0]
+                else:
+                    if not set(spec[:3]) <= symbols:
+                        continue
+                    rcut = float(spec[3]) if len(spec) > 3 else default_rcut
+                    y, _, x = _get_triplet_angle_distribution(frames, spec[:3], rcut, adf_bins)
+                ax.plot(x, y, label=label, linewidth=lw, alpha=0.85)
+                if is_ref:
+                    ax.fill_between(x, y, alpha=0.2)
+        except Exception as e:
+            print(f"Error processing {label}: {e}")
+
+    for ax, (kind, spec) in zip(axes, panels):
+        if kind == "RDF":
+            ax.set_title(f"g(r) {spec[0]}–{spec[1]}")
+            ax.set_xlabel("Distance (Å)")
+            ax.set_ylabel("g(r)")
+            ax.set_xlim(0, rmax)
+        else:
+            ax.set_title(f"ADF {spec[0]}–{spec[1]}–{spec[2]}")
+            ax.set_xlabel("Angle (Degrees)")
+            ax.set_ylabel("Probability")
+            ax.set_xlim(0, 180)
+        ax.set_ylim(0, None)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    fig.tight_layout()
+    save_path = out_dir / "partial_rdf_adf_overlay.png"
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved: {save_path}")
+
+
 def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=None):
     """Overlay VACF or VDOS for multiple trajectories (e.g. AIMD vs MLIP)."""
     if cfg is None:
@@ -218,7 +288,7 @@ def _plot_dynamical_overlay(traj_dict, save_path, mode="VACF", burn_in=0, cfg=No
         vacf_max_fs = cfg.get("plot_vacf_max_fs")
     else:
         xlabel = "Frequency (THz)"
-        title = r"Phonon spectral function $g(\omega)=|\int C(t)e^{-i\omega t}\,dt|^2$"
+        title = r"Vibrational DOS $g(\omega)=\int C(t)\cos(\omega t)\,dt$"
         if vdos_scale == "area":
             ylabel = r"$g(\omega)$ (shape PMF)"
         elif vdos_scale == "peak":
@@ -337,6 +407,7 @@ def _plot_thermo(cfg, out_dir):
     fig_temp, ax_temp = plt.subplots(figsize=(10, 6))
     fig_tot, ax_tot = plt.subplots(figsize=(10, 6))
     fig_pot, ax_pot = plt.subplots(figsize=(10, 6))
+    fig_fluct, ax_fluct = plt.subplots(figsize=(10, 6))
     fig_kin, ax_kin = plt.subplots(figsize=(10, 6))
 
     plotted_temp = plotted_tot = plotted_pot = plotted_kin = False
@@ -390,6 +461,9 @@ def _plot_thermo(cfg, out_dir):
             plotted_kin = True
         if p_col:
             ax_pot.plot(df[x_col], df[p_col], label=lbl, linestyle=ls, alpha=alpha, linewidth=lw)
+            # DFT and MLIP absolute energies differ by a constant; compare fluctuations
+            ax_fluct.plot(df[x_col], df[p_col] - df[p_col].mean(), label=lbl,
+                          linestyle=ls, alpha=alpha, linewidth=lw)
             plotted_pot = True
 
     # Save Temp Plot
@@ -423,7 +497,16 @@ def _plot_thermo(cfg, out_dir):
         ax_pot.grid(True, alpha=0.3)
         fig_pot.tight_layout()
         fig_pot.savefig(out_dir / "pot_energy_vs_step.png", dpi=300)
+
+        ax_fluct.set_xlabel("Simulation Step")
+        ax_fluct.set_ylabel(r"$E_{pot} - \langle E_{pot} \rangle$ (eV)")
+        ax_fluct.set_title("Potential Energy Fluctuations (each run's mean removed)")
+        ax_fluct.legend(loc='best')
+        ax_fluct.grid(True, alpha=0.3)
+        fig_fluct.tight_layout()
+        fig_fluct.savefig(out_dir / "pot_energy_fluct_vs_step.png", dpi=300)
     plt.close(fig_pot)
+    plt.close(fig_fluct)
 
     # Save Kinetic Energy Plot
     if plotted_kin:
@@ -506,15 +589,22 @@ def plot_parity(true_traj_path, pred_traj_path, output_prefix, cfg=None):
             pass 
 
     if len(true_e) > 0:
-        mae = mean_absolute_error(true_e, pred_e) * 1000 # to meV
+        true_e, pred_e = np.array(true_e), np.array(pred_e)
+        de = pred_e - true_e
+        mae = np.mean(np.abs(de)) * 1000  # to meV
+        rmse = np.sqrt(np.mean(de**2)) * 1000
+        offset = de.mean()
+        rmse_shift = np.sqrt(np.mean((de - offset)**2)) * 1000
         s_energy = cfg.get("plot_style", {}).get("scatter_size_energy", 20)
 
         plt.figure(figsize=(6, 6))
         plt.scatter(true_e, pred_e, alpha=0.6, color='royalblue', edgecolors='k', s=s_energy)
-        
-        lims = [min(min(true_e), min(pred_e)), max(max(true_e), max(pred_e))]
-        plt.plot(lims, lims, 'r--', alpha=0.7, label=f'MAE: {mae:.2f} meV/atom')
-        
+
+        lims = [min(true_e.min(), pred_e.min()), max(true_e.max(), pred_e.max())]
+        plt.plot(lims, lims, 'r--', alpha=0.7,
+                 label=f'MAE: {mae:.2f} meV/atom\nRMSE: {rmse:.2f} meV/atom\n'
+                       f'RMSE (offset {offset * 1000:+.1f} removed): {rmse_shift:.2f} meV/atom')
+
         plt.xlabel("Reference Energy (eV/atom)")
         plt.ylabel("Predicted Energy (eV/atom)")
         plt.title("Energy Parity")
@@ -525,30 +615,39 @@ def plot_parity(true_traj_path, pred_traj_path, output_prefix, cfg=None):
         print(f"Saved: {output_prefix}_energy.png")
 
     # --- 2. Force Parity ---
-    true_f_all, pred_f_all = [], []
+    true_f_all, pred_f_all, sym_all = [], [], []
     for i, (tf, pf) in enumerate(zip(true_frames, pred_frames)):
         try:
             true_f_all.append(_get_forces(tf).flatten())
             pred_f_all.append(_get_forces(pf).flatten())
+            sym_all.append(np.repeat(tf.get_chemical_symbols(), 3))
         except ValueError as e:
-            pass 
+            pass
 
     if len(true_f_all) > 0:
         true_f = np.concatenate(true_f_all)
         pred_f = np.concatenate(pred_f_all)
-        mae_f = mean_absolute_error(true_f, pred_f)
+        symbols = np.concatenate(sym_all)
+        mae_f = np.mean(np.abs(pred_f - true_f))
+        rmse_f = np.sqrt(np.mean((pred_f - true_f)**2))
 
         s_forces = cfg.get("plot_style", {}).get("scatter_size_forces", 1)
         plt.figure(figsize=(6, 6))
-        plt.scatter(true_f, pred_f, alpha=0.3, s=s_forces, color='darkorange')
-        
-        lims = [min(min(true_f), min(pred_f)), max(max(true_f), max(pred_f))]
-        plt.plot(lims, lims, 'k--', alpha=0.5, label=f'MAE: {mae_f:.3f} eV/Å')
+        # One colour per element, so e.g. H errors are not hidden under Na/B
+        for el in dict.fromkeys(symbols):
+            m = symbols == el
+            rmse_el = np.sqrt(np.mean((pred_f[m] - true_f[m])**2))
+            plt.scatter(true_f[m], pred_f[m], alpha=0.3, s=s_forces,
+                        label=f'{el} (RMSE {rmse_el:.3f})')
+
+        lims = [min(true_f.min(), pred_f.min()), max(true_f.max(), pred_f.max())]
+        plt.plot(lims, lims, 'k--', alpha=0.5,
+                 label=f'All: MAE {mae_f:.3f}, RMSE {rmse_f:.3f} eV/Å')
         
         plt.xlabel("Reference Force (eV/Å)")
         plt.ylabel("Predicted Force (eV/Å)")
         plt.title("Force Component Parity")
-        plt.legend()
+        plt.legend(markerscale=max(1, 8 / max(s_forces, 1e-3) ** 0.5))
         plt.tight_layout()
         plt.savefig(f"{output_prefix}_forces.png", dpi=300)
         plt.close()

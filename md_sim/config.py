@@ -40,6 +40,7 @@ BOOLEAN_KEYS = frozenset({
     "plot_parity",
     "plot_thermo",
     "run_partial_rdf",
+    "run_partial_adf",
     "run_snapshot_errors",
     "run_element_msd",
     "run_element_vacf",

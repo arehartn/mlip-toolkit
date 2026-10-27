@@ -9,9 +9,8 @@ from scipy.signal import correlate, find_peaks
 from scipy.ndimage import gaussian_filter1d
 from ase.geometry import find_mic
 from scipy.signal.windows import hann
-
-# np.trapz was removed in NumPy 2.x; np.trapezoid replaces it.
-_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+from scipy.integrate import cumulative_trapezoid
+from ase.neighborlist import neighbor_list
 
 # --- 1. Structural Utilities ---
 def _get_distance_distribution(frames, rmax=6.0, bins=100):
@@ -202,6 +201,21 @@ def _stored_velocities_usable(stored, pos_derived, min_frame_frac=0.9, max_rel_e
     return rel_err <= max_rel_err
 
 
+def _stored_velocities_in_A_fs(frames, pos_derived):
+    """Stored velocities converted to Å/fs, or None if they match positions in neither unit.
+
+    ASE-written trajectories store Å per ASE time unit (1 fs = units.fs ≈ 0.098),
+    but AIMD converters often write Å/fs directly, so both are tried against
+    the position-derived velocities.
+    """
+    raw = np.array([f.get_velocities() for f in frames], dtype=float)
+    for label, vels in (("ASE units", raw * units.fs), ("Å/fs", raw)):
+        if _stored_velocities_usable(vels, pos_derived):
+            print(f"    Using stored velocities ({label}).")
+            return vels
+    return None
+
+
 def _get_velocities(frames, dt_fs, log_interval=1):
     """Velocities (Å/fs) for VACF/VDOS; position finite differences when stored data are bad."""
     steps = len(frames)
@@ -211,11 +225,8 @@ def _get_velocities(frames, dt_fs, log_interval=1):
     pos_derived = _velocities_from_positions(frames, dt_fs, log_interval)
 
     try:
-        # ASE stores velocities in Å per ASE time unit (~10.18 fs); convert to Å/fs
-        stored = np.array([f.get_velocities() for f in frames], dtype=float) * units.fs
-        if _stored_velocities_usable(stored, pos_derived):
-            vels = stored
-        else:
+        vels = _stored_velocities_in_A_fs(frames, pos_derived)
+        if vels is None:
             print(
                 "    Warning: Stored velocities missing, partial zeros, or inconsistent "
                 "with positions — using unwrapped position finite differences."
@@ -259,16 +270,27 @@ def _calculate_vacf(frames, dt_fs, log_interval=1, vels=None, indices=None):
     return vacf / vacf[0], lag_fs
 
 
-def _vacf_integration_cutoff(vacf_norm):
-    """Integrate VACF until the first zero crossing (standard GK practice)."""
-    for k in range(1, len(vacf_norm)):
-        if vacf_norm[k] <= 0.0:
-            return k
-    return max(2, 3 * len(vacf_norm) // 4)
+def _gk_plateau(running, max_lag_frac=0.5, plateau_frac=0.5):
+    """D from the plateau of the running Green–Kubo integral.
+
+    The integral runs over the full VACF (through its negative backscattering
+    lobes) up to max_lag_frac of the trajectory; longer lags have too few time
+    origins. D is the mean of the running integral over the last plateau_frac
+    of that window, and its std there (m²/s) is returned as a convergence
+    flag: compare it with D to see whether the running integral has levelled off.
+    """
+    n_max = min(len(running), max(3, int(len(running) * max_lag_frac)))
+    lo = min(int(n_max * (1.0 - plateau_frac)), n_max - 2)
+    window = running[lo:n_max]
+    return float(window.mean()), float(window.std())
 
 
-def _green_kubo_diffusion(frames, dt_fs, log_interval=1, vels=None, indices=None):
-    """Self-diffusion from Green–Kubo: D = (1/(3N)) ∫₀^t_c ⟨Σ_i v_i(0)·v_i(t)⟩ dt."""
+def _green_kubo_diffusion(frames, dt_fs, log_interval=1, vels=None, indices=None,
+                          max_lag_frac=0.5, plateau_frac=0.5):
+    """Self-diffusion from Green–Kubo: D = (1/(3N)) ∫₀^∞ ⟨Σ_i v_i(0)·v_i(t)⟩ dt.
+
+    Returns (D, plateau std, running integral D(t) in m²/s, lag in fs).
+    """
     vels = _select_velocities(frames, dt_fs, log_interval, vels, indices)
     n_atoms = vels.shape[1]
     vacf = _vacf_unnormalized(vels)
@@ -277,13 +299,11 @@ def _green_kubo_diffusion(frames, dt_fs, log_interval=1, vels=None, indices=None
 
     dt_frame_s = dt_fs * log_interval * 1e-15
     lag_s = np.arange(len(vacf)) * dt_frame_s
-    vacf_norm = vacf / vacf[0]
-    cutoff = _vacf_integration_cutoff(vacf_norm)
-
-    integral = _trapezoid(vacf[:cutoff], lag_s[:cutoff])
     # VACF is in (Å/fs)², lag_s in s → integral in Å²·s/fs² → m²/s via ×1e10
     # (1 Å/fs)²·s = 10⁻²⁰ m² / (10⁻³⁰ s²) · s = 10¹⁰ m²/s
-    return integral / (3.0 * n_atoms) * 1e10
+    running = cumulative_trapezoid(vacf, lag_s, initial=0.0) / (3.0 * n_atoms) * 1e10
+    d, std = _gk_plateau(running, max_lag_frac, plateau_frac)
+    return d, std, running, lag_s * 1e15
 
 
 def _aimd_dt_params(cfg, dt_fs, log_int):
@@ -307,7 +327,7 @@ def traj_dt_params(traj_path, cfg):
 
 
 def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1, vels=None, indices=None):
-    """Phonon spectral function g(ω) = |∫ C(t) e^{-iωt} dt|² from windowed normalized VACF."""
+    """VDOS g(ω) = ∫ C(t) cos(ωt) dt (Fourier transform of the even VACF), Hann-windowed."""
     vels = _select_velocities(frames, dt_fs, log_interval, vels, indices)
     vacf = _vacf_unnormalized(vels)
     if vacf[0] == 0.0:
@@ -317,12 +337,15 @@ def _calculate_vdos_spectrum(frames, dt_fs, log_interval=1, vels=None, indices=N
     steps = len(vacf)
     dt_frame_s = dt_fs * log_interval * 1e-15
     window = hann(2 * steps - 1)[steps - 1:]
-    ft = np.fft.rfft(vacf * window)
-    vdos_raw = (np.abs(ft) ** 2) * dt_frame_s
+    windowed = vacf * window
+    # Full-line transform of the even function C(|t|): 2·Re Σ_{n≥0} − C(0)
+    vdos_raw = (2.0 * np.fft.rfft(windowed).real - windowed[0]) * dt_frame_s
 
     freqs_thz = np.fft.rfftfreq(steps, d=dt_frame_s) * 1e-12
 
-    vdos_pmf = vdos_raw / np.sum(vdos_raw) if np.sum(vdos_raw) > 0 else vdos_raw
+    # Windowing ripples can dip slightly below zero; EMD weights must be non-negative
+    w = np.clip(vdos_raw, 0.0, None)
+    vdos_pmf = w / w.sum() if w.sum() > 0 else w
     return vdos_raw, vdos_pmf, freqs_thz
 
 
@@ -380,6 +403,55 @@ def _get_partial_rdfs(frames, pairs, rmax=6.0, bins=100):
     return out, r_centers
 
 
+def _get_triplet_angle_distribution(frames, triplet, rcut, bins=90):
+    """Angle distribution for one a–center–b triplet (e.g. H–B–H), as a PMF.
+
+    Both a and b must lie within rcut of the center atom. Returns
+    (pmf, raw_counts, angle_centers).
+    """
+    a, center, b = triplet
+    bin_edges = np.linspace(0, 180, bins + 1)
+    angle_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    hists = np.zeros(bins)
+
+    for frame in frames:
+        sym = np.array(frame.get_chemical_symbols())
+        i, j, D = neighbor_list("ijD", frame, rcut)
+        keep = (sym[i] == center) & np.isin(sym[j], (a, b))
+        i, j, D = i[keep], j[keep], D[keep]
+        D = D / np.linalg.norm(D, axis=1)[:, None]
+
+        for c in np.unique(i):
+            m = i == c
+            vecs, nsym = D[m], sym[j[m]]
+            cos = np.clip(vecs @ vecs.T, -1.0, 1.0)
+            if a == b:
+                iu = np.triu_indices(len(vecs), k=1)
+                cos = cos[iu][(nsym[iu[0]] == a) & (nsym[iu[1]] == a)]
+            else:
+                cos = cos[np.ix_(nsym == a, nsym == b)].ravel()
+            hists += np.histogram(np.degrees(np.arccos(cos)), bins=bin_edges)[0]
+
+    pmf = hists / hists.sum() if hists.sum() > 0 else hists
+    return pmf, hists, angle_centers
+
+
+def _partial_adf_triplets(cfg, elements):
+    """[(a, center, b, rcut)] from cfg['partial_adf_triplets'].
+
+    Entries are ["H","B","H"] (uses partial_adf_rcut) or ["H","B","H", 1.4].
+    """
+    default_rcut = cfg.get("partial_adf_rcut", 1.5)
+    out = []
+    for t in cfg.get("partial_adf_triplets") or []:
+        a, c, b = t[:3]
+        if not {a, c, b} <= set(elements):
+            print(f"  Skipping partial ADF {a}-{c}-{b}: element not in both trajectories.")
+            continue
+        out.append((a, c, b, float(t[3]) if len(t) > 3 else default_rcut))
+    return out
+
+
 def _first_peak(x, y, rel_prominence=0.1):
     """(position, height) of the first prominent peak; falls back to the global max."""
     if not np.any(y > 0):
@@ -396,17 +468,18 @@ def _rdf_emd(x, ref_g, pred_g):
     return wasserstein_distance(x, x, u_weights=ref_w, v_weights=pred_w)
 
 
-def _vacf_emd(ref_vacf, ref_lag, pred_vacf, pred_lag):
-    """EMD (fs) between |C(t)| envelopes, with pred interpolated onto the ref lag axis.
+def _vacf_curve_errors(ref_vacf, ref_lag, pred_vacf, pred_lag, max_fs=None):
+    """(RMSE, MAE) between normalized VACFs C(t)/C(0) on the reference lag grid.
 
-    VACF goes negative (backscattering) and EMD needs non-negative weights.
+    Compared pointwise rather than with EMD so the negative (backscattering)
+    lobes count with their sign. Lags are limited to max_fs, by default half the
+    shorter trajectory, beyond which few time origins contribute.
     """
-    if len(ref_lag) != len(pred_lag) or not np.allclose(ref_lag, pred_lag):
-        pred_vacf = np.interp(ref_lag, pred_lag, pred_vacf)
-    ref_abs, pred_abs = np.abs(ref_vacf), np.abs(pred_vacf)
-    ref_w = ref_abs / ref_abs.sum() if ref_abs.sum() > 0 else ref_abs
-    pred_w = pred_abs / pred_abs.sum() if pred_abs.sum() > 0 else pred_abs
-    return wasserstein_distance(ref_lag, ref_lag, u_weights=ref_w, v_weights=pred_w)
+    t_max = min(ref_lag[-1], pred_lag[-1])
+    t_max = t_max / 2 if max_fs is None else min(max_fs, t_max)
+    mask = ref_lag <= t_max
+    diff = np.interp(ref_lag[mask], pred_lag, pred_vacf) - ref_vacf[mask]
+    return float(np.sqrt(np.mean(diff**2))), float(np.mean(np.abs(diff)))
 
 
 def _vdos_emd(ref_freq, ref_pmf, pred_freq, pred_pmf):
@@ -913,8 +986,15 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
     if cfg.get("run_energy", True):
         ref_epot = ref_epot_total / n_ref
         pred_epot = pred_epot_total / n_pred
-        res["EMD_Epot_eV_atom"] = wasserstein_distance(ref_epot, pred_epot)
-        res["EMD_Epot_eV_raw"] = wasserstein_distance(ref_epot_total, pred_epot_total)
+        # DFT and MLIP absolute energies differ by a constant reference offset, so
+        # the distributions are compared as fluctuations about each run's mean.
+        res["Epot_mean_offset_eV_atom"] = pred_epot.mean() - ref_epot.mean()
+        res["EMD_Epot_fluct_eV_atom"] = wasserstein_distance(
+            ref_epot - ref_epot.mean(), pred_epot - pred_epot.mean())
+        res["EMD_Epot_fluct_eV_raw"] = wasserstein_distance(
+            ref_epot_total - ref_epot_total.mean(), pred_epot_total - pred_epot_total.mean())
+        res["Epot_std_ratio"] = (
+            pred_epot_total.std() / ref_epot_total.std() if ref_epot_total.std() > 0 else np.nan)
 
         _print_kinetic_energy_diagnostics(
             "Reference", ref_ekin_total, n_ref, temp_k, ref_src["ekin"])
@@ -928,6 +1008,8 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
         raw_data["Ref_Epot_eV_atom"] = ref_epot
         raw_data["Pred_Epot_eV_atom"] = pred_epot
+        raw_data["Ref_Epot_fluct_eV_atom"] = ref_epot - ref_epot.mean()
+        raw_data["Pred_Epot_fluct_eV_atom"] = pred_epot - pred_epot.mean()
         raw_data["Ref_Epot_eV_total"] = ref_epot_total
         raw_data["Pred_Epot_eV_total"] = pred_epot_total
         raw_data["Ref_Ekin_eV_atom"] = ref_ekin
@@ -1009,6 +1091,33 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             raw_data[f"pRDF_{label}_Ref_g_r"] = ref_g
             raw_data[f"pRDF_{label}_Pred_g_r"] = pred_g
 
+    # 4c. Partial ADFs for specific a–center–b triplets (e.g. H–B–H in the cages)
+    if cfg.get("run_partial_adf", False):
+        triplets = _partial_adf_triplets(cfg, elements)
+        if not triplets:
+            print("  run_partial_adf is on but no partial_adf_triplets are set; skipping.")
+        bins = cfg.get("partial_adf_bins", 90)
+        for a, c, b, rcut in triplets:
+            label = f"{a}-{c}-{b}"
+            ref_p, ref_raw, x_padf = _get_triplet_angle_distribution(
+                ref_struct, (a, c, b), rcut, bins)
+            pred_p, pred_raw, _ = _get_triplet_angle_distribution(
+                pred_struct, (a, c, b), rcut, bins)
+            if ref_raw.sum() == 0 or pred_raw.sum() == 0:
+                print(f"  Partial ADF {label}: no angles within {rcut} Å; increase rcut.")
+                continue
+
+            res[f"EMD_pADF_{label}_Degrees"] = wasserstein_distance(
+                x_padf, x_padf, u_weights=ref_p, v_weights=pred_p)
+            res[f"pADF_{label}_mean_ref_deg"] = float(np.sum(x_padf * ref_p))
+            res[f"pADF_{label}_mean_pred_deg"] = float(np.sum(x_padf * pred_p))
+            res[f"pADF_{label}_peak_ref_deg"] = _first_peak(x_padf, ref_p)[0]
+            res[f"pADF_{label}_peak_pred_deg"] = _first_peak(x_padf, pred_p)[0]
+
+            raw_data["pADF_Angle_Degrees"] = x_padf
+            raw_data[f"pADF_{label}_Ref_Prob"] = ref_p
+            raw_data[f"pADF_{label}_Pred_Prob"] = pred_p
+
     # 5. ADF (Angular Distribution Function)
     if cfg.get("run_adf", True):
         ref_adf_norm, ref_adf_raw, x_adf = _get_angle_distribution(ref_struct)
@@ -1054,8 +1163,17 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             _vel_cache["pred"] = _get_velocities(pred_frames, dt_fs, log_int)
         return _vel_cache["pred"]
 
+    # Species-resolved diffusion: every element with run_element_msd, otherwise only
+    # cfg['diffusion_elements'] (e.g. ["Na"] so immobile B/H don't dilute the mobile ion)
+    if cfg.get("run_element_msd", False):
+        diff_elements = elements
+    else:
+        diff_elements = [el for el in (cfg.get("diffusion_elements") or []) if el in elements]
+        for el in set(cfg.get("diffusion_elements") or []) - set(diff_elements):
+            print(f"  Skipping diffusion for {el}: not present in both trajectories.")
+
     # 7. Diffusion Coefficient from MSD (Einstein relation: MSD = 6*D*t)
-    if cfg.get("run_msd", True) or cfg.get("run_element_msd", False):
+    if cfg.get("run_msd", True) or diff_elements:
         ref_pos = _com_free_positions(ref_frames)
         pred_pos = _com_free_positions(pred_frames)
         ref_time_s = np.arange(len(ref_frames)) * ref_dt_frame_s
@@ -1081,8 +1199,8 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
         raw_data["Pred_MSD_vs_Time_A2"] = pred_msd_arr
 
     # 7a. Element-resolved MSD diffusion (+ Green–Kubo if run_green_kubo)
-    if cfg.get("run_element_msd", False):
-        for el in elements:
+    if diff_elements:
+        for el in diff_elements:
             ref_msd_el = _msd_from_positions(ref_pos[:, ref_el[el]])
             pred_msd_el = _msd_from_positions(pred_pos[:, pred_el[el]])
             D_ref_el = _msd_diffusion_coeff(ref_msd_el, ref_time_s)
@@ -1099,29 +1217,35 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
 
     # 7b. Diffusion coefficient — Green–Kubo (VACF integral)
     if cfg.get("run_green_kubo", True):
-        try:
-            D_ref_gk = _green_kubo_diffusion(
-                ref_frames, aimd_dt_fs, aimd_log_interval, vels=ref_vels())
-            D_pred_gk = _green_kubo_diffusion(
-                pred_frames, dt_fs, log_int, vels=pred_vels())
+        gk_kw = {
+            "max_lag_frac": cfg.get("gk_max_lag_frac", 0.5),
+            "plateau_frac": cfg.get("gk_plateau_frac", 0.5),
+        }
+        gk_targets = [("", None, None)] + [
+            (f"_{el}", ref_el[el], pred_el[el]) for el in diff_elements]
+        for suffix, ref_idx, pred_idx in gk_targets:
+            try:
+                D_ref_gk, std_ref, run_ref, lag_ref = _green_kubo_diffusion(
+                    ref_frames, aimd_dt_fs, aimd_log_interval,
+                    vels=ref_vels(), indices=ref_idx, **gk_kw)
+                D_pred_gk, std_pred, run_pred, lag_pred = _green_kubo_diffusion(
+                    pred_frames, dt_fs, log_int,
+                    vels=pred_vels(), indices=pred_idx, **gk_kw)
 
-            res["D_ref_GK_m2_s"] = D_ref_gk
-            res["D_pred_GK_m2_s"] = D_pred_gk
-            res["D_GK_Error_m2_s"] = abs(D_ref_gk - D_pred_gk)
+                res[f"D_ref_GK{suffix}_m2_s"] = D_ref_gk
+                res[f"D_pred_GK{suffix}_m2_s"] = D_pred_gk
+                res[f"D_GK_Error{suffix}_m2_s"] = abs(D_ref_gk - D_pred_gk)
+                # Std of the running integral over the plateau window; comparable
+                # to D means it has not levelled off (D not converged)
+                res[f"GK_plateau_std_ref{suffix}_m2_s"] = std_ref
+                res[f"GK_plateau_std_pred{suffix}_m2_s"] = std_pred
 
-            if cfg.get("run_element_msd", False):
-                for el in elements:
-                    D_ref_el = _green_kubo_diffusion(
-                        ref_frames, aimd_dt_fs, aimd_log_interval,
-                        vels=ref_vels(), indices=ref_el[el])
-                    D_pred_el = _green_kubo_diffusion(
-                        pred_frames, dt_fs, log_int,
-                        vels=pred_vels(), indices=pred_el[el])
-                    res[f"D_ref_GK_{el}_m2_s"] = D_ref_el
-                    res[f"D_pred_GK_{el}_m2_s"] = D_pred_el
-                    res[f"D_GK_Error_{el}_m2_s"] = abs(D_ref_el - D_pred_el)
-        except Exception as e:
-            print(f"Warning: Could not compute Green–Kubo diffusion: {e}")
+                raw_data[f"Ref_GK{suffix}_Lag_fs"] = lag_ref
+                raw_data[f"Ref_GK{suffix}_Running_D_m2_s"] = run_ref
+                raw_data[f"Pred_GK{suffix}_Lag_fs"] = lag_pred
+                raw_data[f"Pred_GK{suffix}_Running_D_m2_s"] = run_pred
+            except Exception as e:
+                print(f"Warning: Could not compute Green–Kubo diffusion{suffix}: {e}")
 
     # 8. Velocity Autocorrelation Function (VACF), total and per element
     vacf_targets = []
@@ -1137,8 +1261,11 @@ def validate_trajectories(ref_path, pred_path, temp_k, dt_fs, burn_in=0, cfg=Non
             pred_vacf, pred_vacf_lag = _calculate_vacf(
                 pred_frames, dt_fs, log_int, vels=pred_vels(), indices=pred_idx)
 
-            res[f"EMD_VACF{suffix}_fs"] = _vacf_emd(
-                ref_vacf, ref_vacf_lag, pred_vacf, pred_vacf_lag)
+            rmse, mae = _vacf_curve_errors(
+                ref_vacf, ref_vacf_lag, pred_vacf, pred_vacf_lag,
+                cfg.get("vacf_compare_max_fs"))
+            res[f"VACF{suffix}_RMSE"] = rmse
+            res[f"VACF{suffix}_MAE"] = mae
 
             raw_data[f"Ref_VACF{suffix}_Lag_fs"] = ref_vacf_lag
             raw_data[f"Ref_VACF{suffix}"] = ref_vacf

@@ -161,9 +161,13 @@ The package ships default configs at `md_sim/configs/simulation.json` and `md_si
 | `aimd_dt_fs`, `aimd_log_interval` | Overrides for references logged at a different cadence than the MLIP run |
 | `validation_output_csv` | Destination for scalar metrics |
 | `run_snapshot_errors`, `snapshot_stride`, `snapshot_max_frames` | MLIP single points on reference frames: energy / force / stress MAE and RMSE, per-element force errors; feeds the parity plots. Uses `model_type` / `model_variant` / `device` / `head` from the same config |
-| `structure_frame_stride` | Use every Nth frame for RDF / ADF / partial RDF (default 1) |
-| `run_partial_rdf`, `partial_rdf_pairs` | Partial *g*<sub>ab</sub>(r); all element pairs unless pairs are listed, e.g. `[["B","H"],["Na","B"]]` |
-| `run_element_msd`, `run_element_vacf`, `run_element_vdos` | Per-element MSD (+ Green–Kubo if `run_green_kubo`), VACF, VDOS |
+| `structure_frame_stride` | Use every Nth frame for RDF / ADF / partial RDF / partial ADF (default 1) |
+| `run_partial_rdf`, `partial_rdf_pairs` | Partial *g*<sub>ab</sub>(r); all element pairs unless pairs are listed, e.g. `[["Na","Na"],["Na","B"],["B","H"]]` |
+| `run_partial_adf`, `partial_adf_triplets`, `partial_adf_rcut` | Angle distributions for specific a–center–b triplets, e.g. `[["H","B","H"]]`; both neighbours must be within `partial_adf_rcut` of the center (an optional 4th entry overrides it per triplet) |
+| `diffusion_elements` | Species for MSD and Green–Kubo diffusion, e.g. `["Na"]`, so immobile species don't dilute the mobile-ion D |
+| `gk_max_lag_frac`, `gk_plateau_frac` | Green–Kubo running integral is taken up to this fraction of the trajectory; D is its mean over the last `gk_plateau_frac` of that window |
+| `vacf_compare_max_fs` | Max lag for VACF RMSE/MAE (default: half the shorter trajectory) |
+| `run_element_msd`, `run_element_vacf`, `run_element_vdos` | Per-element MSD + Green–Kubo for every element (overrides `diffusion_elements`), VACF, VDOS |
 | `run_vdos_peaks`, `vdos_peak_*` | VDOS peak detection and matching (smoothing, prominence, max frequency, tolerance) |
 
 **Static validation** (`"job": "static"`)
@@ -223,11 +227,11 @@ The same script serves both MD and validation stages without modification, since
 | Category | Observables |
 |---|---|
 | Snapshot accuracy | Energy (raw and offset-removed), force and stress errors of MLIP single points on the reference configurations; per-element force errors; force direction cosine |
-| Energetics | Potential and kinetic energy distributions (per-atom and system total); heat capacity error from energy variance |
+| Energetics | Potential energy fluctuation distributions (each run's mean removed; the mean offset is reported separately) and kinetic energy distributions; heat capacity error from energy variance |
 | Forces | Force-magnitude distribution |
-| Structure | Radial distribution function *g(r)*; angular distribution function |
-| Transport | Mean squared displacement → Einstein diffusion coefficient; Green–Kubo diffusion coefficient |
-| Vibrational | Velocity autocorrelation function; vibrational density of states; VDOS peak positions |
+| Structure | Radial distribution function *g(r)*; angular distribution function; partial RDFs (e.g. Na–Na, Na–B, B–H) and triplet ADFs (e.g. H–B–H) |
+| Transport | Mean squared displacement → Einstein diffusion coefficient; Green–Kubo diffusion coefficient (running-integral plateau); both optionally for selected species only (`diffusion_elements`) |
+| Vibrational | Velocity autocorrelation function (pointwise RMSE/MAE of C(t)/C(0)); vibrational density of states; VDOS peak positions |
 | Element-resolved | Partial RDFs for every element pair (first-peak position and EMD); per-element MSD, Green–Kubo, VACF, VDOS |
 
 `md_sim/static_validation.py` covers the 0 K side: MLIP forces and pressure at the reference geometry, fixed- and variable-cell relaxations, lattice parameters, position RMSD, bond lengths, space group, and the harmonic phonon DOS with an imaginary-mode check.
@@ -243,8 +247,11 @@ Several details in the validation pipeline address failure modes that are easy t
 - **Kinetic energy extraction.** AIMD trajectories frequently contain missing, zeroed, or unit-inconsistent velocities. Velocity-derived kinetic energy is cross-checked against trajectory metadata and an equipartition estimate (3/2 *N* k_B*T*) before being accepted, with explicit warnings on fallback rather than silent propagation of invalid values.
 - **Velocity reconstruction.** Where stored velocities are unusable, velocities are recovered by central-difference differentiation of periodic-boundary-unwrapped positions, with center-of-mass drift removed prior to VACF and VDOS computation.
 - **MSD fitting window.** Mean squared displacement is computed from unwrapped, centre-of-mass-corrected coordinates over multiple time origins. The log-log slope α of MSD vs. *t* over the fit window is reported (`MSD_alpha_*`); D is only meaningful where α ≈ 1. The diffusion coefficient is fit to the central 25–75% of the curve, excluding the short-time ballistic regime and the long-time tail where few time origins contribute.
-- **Green–Kubo diffusion.** *D* = (1/3*N*) ∫₀^tc ⟨Σᵢ **v**ᵢ(0)·**v**ᵢ(*t*)⟩ d*t*, currently integrated to the first zero crossing of the VACF. This truncation captures mainly the short-time vibrational part of the VACF and yields a nonzero *D* even for a non-diffusing crystal, so the current GK values should not be read as a converged transport estimate (see [Known limitations](#known-limitations-and-ongoing-work)).
-- **VDOS comparison.** The vibrational density of states is obtained from a Hann-windowed FFT of the normalized VACF and compared as a normalized spectral distribution, so that spectra differing in amplitude scale but not in shape are not penalized disproportionately.
+- **Green–Kubo diffusion.** *D* = (1/3*N*) ∫₀^∞ ⟨Σᵢ **v**ᵢ(0)·**v**ᵢ(*t*)⟩ d*t*. The running integral is taken over the full VACF, including its negative backscattering lobes, up to `gk_max_lag_frac` of the trajectory; *D* is the mean of the running integral over its plateau, and the std over that window is reported (`GK_plateau_std_*`) as a convergence check. Stopping at the first zero crossing, as earlier versions did, keeps only the positive vibrational lobe and gives a spurious nonzero *D* for a crystal. The running integral is saved to the raw-data CSV.
+- **VDOS.** The vibrational density of states is the Fourier (cosine) transform of the Hann-windowed normalized VACF, *g*(ω) = ∫ *C*(*t*) cos(ω*t*) d*t*, not its squared modulus, so relative peak heights are not exaggerated. It is compared as a normalized spectral distribution.
+- **VACF comparison.** C(t) goes negative, which EMD cannot handle, so VACFs are compared pointwise (RMSE and MAE of C(t)/C(0)) on a common lag grid.
+- **Energy offset.** DFT and MLIP absolute energies differ by a constant, so potential-energy distributions are compared after subtracting each run's mean (`EMD_Epot_fluct_*`); the offset itself is `Epot_mean_offset_eV_atom`.
+- **Stored velocity units.** ASE-written trajectories store velocities in Å per ASE time unit, while many AIMD converters write Å/fs. Both interpretations are tested against position-derived velocities and the one that matches is used.
 - **Timestep reconciliation.** `aimd_dt_fs` and `aimd_log_interval` permit comparison of trajectories logged at differing intervals without manual resampling.
 - **RDF normalization.** *g(r)* is normalized against ideal-gas pair counts only; additional normalization by number density is a common error that flattens the resulting distribution.
 
@@ -311,11 +318,9 @@ These figures derive from a single production run rather than a systematic sweep
 
 ## Known limitations and ongoing work
 
-- **Green–Kubo truncation.** GK diffusion is integrated only to the first VACF zero crossing; it will be replaced by a full running integral with plateau detection.
 - **Trajectory length.** Analyzed trajectories of 0.1–0.6 ps are too short for converged diffusion. The reported `MSD_alpha` exponent (α ≈ 1 for diffusive motion) is used to flag this.
 - **No uncertainty estimates yet.** All results come from single trajectories; multi-seed runs and block averaging are planned.
-- **VDOS definition.** The vibrational spectrum is currently computed as |FT(C(t))|², which preserves peak positions but distorts relative intensities compared with the standard FT(C(t)).
-- **Pipeline fixes after the benchmarks above.** Stored ASE velocities are now converted to Å/fs (they were previously always rejected in favour of finite-difference velocities); centre-of-mass drift is now removed from the MSD; the benchmark numbers will be regenerated with the current code.
+- **Pipeline fixes after the benchmarks above.** Stored velocities are now unit-checked (they were previously always rejected in favour of finite-difference velocities); centre-of-mass drift is removed from the MSD; Green–Kubo uses the running-integral plateau instead of the first zero crossing; the VDOS is FT(C(t)) instead of |FT(C(t))|²; *E*_pot distributions are compared as fluctuations; VACF EMD is replaced by RMSE/MAE. Snapshot energy/force errors (`run_snapshot_errors`) are now on by default. The benchmark numbers will be regenerated with the current code.
 
 ---
 
